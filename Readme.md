@@ -19,6 +19,8 @@
 - 🏋️ **In-repo training** on text corpora or sample-compatible `binidx` datasets
 - 💾 **Burn checkpoints** for continuing training and reusing trained models in inference
 
+Inference now defaults to **LibTorch** for numerical stability, while training stays on the Burn autodiff + WGPU path.
+
 ---
 
 ## Help wanted
@@ -45,9 +47,7 @@ Download the model weights from Huggingface: https://huggingface.co/BlinkDL/rwkv
 Convert them into SafeTensors format:
 
 ```bash
-pip3 install torch --index-url https://download.pytorch.org/whl/cpu
-pip3 install safetensors
-python weights_to_safetensors.py path/to/model_weights.pth
+uv run weights_to_safetensors.py path/to/model_weights.pth
 ```
 
 
@@ -57,7 +57,7 @@ python weights_to_safetensors.py path/to/model_weights.pth
 
 ```bash
 wget https://huggingface.co/BlinkDL/rwkv-7-world/resolve/main/RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth
-python weights_to_safetensors.py RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth
+uv run weights_to_safetensors.py RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth
 ```
 
 ### Run interactive inference from safetensors

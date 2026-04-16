@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use burn::{
-    backend::{Autodiff, Wgpu},
+    backend::{Autodiff, LibTorch, Wgpu},
     config::Config as BurnConfig,
     prelude::*,
     record::CompactRecorder,
@@ -234,7 +234,7 @@ fn main() -> Result<()> {
 }
 
 fn run_generate(config: &Config) -> Result<()> {
-    type BackendImpl = Wgpu;
+    type BackendImpl = LibTorch;
 
     let device = Default::default();
     let model = load_or_init_model::<BackendImpl>(config, &device)?;
