@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.100"
+anyhow = "1.0.102"
 burn = { version = "0.20.1", default-features = false, features = ["std", "autodiff", "train", "wgpu"] }
 burn-cubecl = { version = "0.20.1", default-features = false, features = ["std", "autotune", "fusion"] }
-clap = { version = "4.5.38", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 cubecl = { version = "0.9.0", default-features = false, features = ["std", "stdlib", "wgpu"] }
-memmap2 = "0.9.5"
-rand = "0.9.1"
+memmap2 = "0.9.10"
+rand = "0.9.4"
 rwkv-tokenizer = "0.9.1"
-safetensors = "0.5.3"
+safetensors = "0.7.0"
 
 [profile.release]
 codegen-units = 1
