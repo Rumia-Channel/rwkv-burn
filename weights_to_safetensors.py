@@ -1,3 +1,13 @@
+# /// script
+# requires-python = "<3.14,>=3.13"
+# dependencies = [
+#   "torch",
+#   "safetensors",
+#   "numpy",
+#   "packaging",
+# ]
+# ///
+
 import torch
 import numpy as np
 import argparse
