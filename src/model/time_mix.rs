@@ -1,9 +1,11 @@
 use burn::{
-    module::Param,
+    module::{Ignored, Param},
     nn::{GroupNorm, GroupNormConfig, Linear, LinearConfig},
     prelude::*,
-    tensor::{Tensor, activation, s},
+    tensor::{Tensor, activation},
 };
+
+use super::kernels::WkvKernel;
 
 /// A module implementing the TimeMix layer for sequential processing.
 ///
@@ -48,7 +50,7 @@ pub struct TimeMix<B: Backend> {
     pub k_a: Param<Tensor<B, 3>>,
     pub r_k: Param<Tensor<B, 2>>,
 
-    wkv_op: WKVv7,
+    wkv_op: Ignored<WkvKernel>,
 
     pub receptance: Linear<B>,
     pub key: Linear<B>,
@@ -86,15 +88,28 @@ impl<B: Backend> TimeMix<B> {
         d_mv_lora: usize,
         d_gate_lora: usize,
     ) -> TimeMix<B> {
-        let x_r = Param::from_tensor(Tensor::<B, 3>::empty([1, 1, d_model], device));
+        let ratio_0_to_1 = layer_id as f32 / n_layer.saturating_sub(1).max(1) as f32;
+        let ratio_1_to_almost0 = 1.0 - (layer_id as f32 / n_layer.max(1) as f32);
 
-        let x_w = Param::from_tensor(Tensor::<B, 3>::empty([1, 1, d_model], device));
-        let x_k = Param::from_tensor(Tensor::<B, 3>::empty([1, 1, d_model], device));
-        let x_v = Param::from_tensor(Tensor::<B, 3>::empty([1, 1, d_model], device));
-        let x_a = Param::from_tensor(Tensor::<B, 3>::empty([1, 1, d_model], device));
-        let x_g = Param::from_tensor(Tensor::<B, 3>::empty([1, 1, d_model], device));
+        let x_r =
+            Param::from_tensor(init_mix_vector::<B>(device, d_model, 0.2 * ratio_1_to_almost0));
+        let x_w =
+            Param::from_tensor(init_mix_vector::<B>(device, d_model, 0.9 * ratio_1_to_almost0));
+        let x_k =
+            Param::from_tensor(init_mix_vector::<B>(device, d_model, 0.7 * ratio_1_to_almost0));
+        let x_v =
+            Param::from_tensor(init_mix_vector::<B>(device, d_model, 0.7 * ratio_1_to_almost0));
+        let x_a =
+            Param::from_tensor(init_mix_vector::<B>(device, d_model, 0.9 * ratio_1_to_almost0));
+        let x_g =
+            Param::from_tensor(init_mix_vector::<B>(device, d_model, 0.2 * ratio_1_to_almost0));
 
-        let w0 = Param::from_tensor(Tensor::<B, 3>::empty([1, 1, d_model], device));
+        let w0 = Param::from_tensor(init_w0::<B>(
+            device,
+            d_model,
+            head_size,
+            ratio_0_to_1,
+        ));
         let w1 = LinearConfig::new(d_model, d_decay_lora)
             .with_bias(false)
             .init::<B>(device);
@@ -102,7 +117,7 @@ impl<B: Backend> TimeMix<B> {
             .with_bias(false)
             .init::<B>(device);
 
-        let a0 = Param::from_tensor(Tensor::<B, 3>::empty([1, 1, d_model], device));
+        let a0 = Param::from_tensor(init_a0::<B>(device, d_model, head_size));
         let a1 = LinearConfig::new(d_model, d_aaa_lora)
             .with_bias(false)
             .init::<B>(device);
@@ -110,7 +125,7 @@ impl<B: Backend> TimeMix<B> {
             .with_bias(false)
             .init::<B>(device);
 
-        let v0 = Param::from_tensor(Tensor::<B, 3>::empty([1, 1, d_model], device));
+        let v0 = Param::from_tensor(init_v0::<B>(device, d_model));
         let v1 = LinearConfig::new(d_model, d_mv_lora)
             .with_bias(false)
             .init::<B>(device);
@@ -125,9 +140,9 @@ impl<B: Backend> TimeMix<B> {
             .with_bias(false)
             .init::<B>(device);
 
-        let k_k = Param::from_tensor(Tensor::<B, 3>::empty([1, 1, d_model], device));
-        let k_a = Param::from_tensor(Tensor::<B, 3>::empty([1, 1, d_model], device));
-        let r_k = Param::from_tensor(Tensor::<B, 2>::empty([n_heads, head_size], device));
+        let k_k = Param::from_tensor(init_kk::<B>(device, d_model));
+        let k_a = Param::from_tensor(init_constant_1x1::<B>(device, d_model, 1.02));
+        let r_k = Param::from_tensor(init_constant_2d::<B>(device, n_heads, head_size, -0.04));
 
         //time_shift = nn.ZeroPad2d((0, 0, 1, -1))
         let receptance = LinearConfig::new(d_model, d_model)
@@ -150,7 +165,7 @@ impl<B: Backend> TimeMix<B> {
             .with_epsilon(64e-5)
             .init(device);
 
-        let wkv_op = WKVv7::new(n_heads, head_size);
+        let wkv_op = Ignored(WkvKernel::new(n_heads, head_size));
 
         TimeMix {
             layer_id,
@@ -248,19 +263,22 @@ impl<B: Backend> TimeMix<B> {
         let k = self.key.forward(xk);
         let kk = k.clone().mul(self.k_k.val());
         let kk = kk.reshape([batch_size, time_steps, self.n_heads, self.head_size]);
-        let kk = (kk.clone().div(kk.clone().mul(kk.clone()).sum_dim(3))).reshape([
-            batch_size,
-            time_steps,
-            self.d_model,
-        ]);
+        let kk_norm = kk
+            .clone()
+            .mul(kk.clone())
+            .sum_dim(3)
+            .add_scalar(1e-12)
+            .sqrt()
+            .reshape([batch_size, time_steps, self.n_heads, 1]);
+        let kk = kk.clone().div(kk_norm).reshape([batch_size, time_steps, self.d_model]);
         let k = k
             .clone()
             .mul((a.clone() - 1).mul(self.k_a.val()).add_scalar(1.0));
 
-        let (x, state)=
+        let (x, state): (Tensor<B, 3>, Tensor<B, 4>) =
             self.wkv_op
                 .clone()
-                .forward(r.clone(), w, k.clone(), v.clone(), -kk.clone(), kk.mul(a));
+                .forward_parallel(r.clone(), w, k.clone(), v.clone(), -kk.clone(), kk.mul(a));
 
         let x = self
             .group_norm
@@ -339,7 +357,17 @@ impl<B: Backend> TimeMix<B> {
 
         let kk = k.clone().mul(self.k_k.val().reshape([self.d_model]));
         let kk = kk.reshape([self.n_heads, self.head_size]);
-        let kk = (kk.clone().div(kk.clone().mul(kk.clone()).sum_dim(1))).reshape([self.d_model]);
+        let kk = kk
+            .clone()
+            .div(
+                kk.clone()
+                    .mul(kk.clone())
+                    .sum_dim(1)
+                    .add_scalar(1e-12)
+                    .sqrt()
+                    .reshape([self.n_heads, 1]),
+            )
+            .reshape([self.d_model]);
         let k = k.clone().mul(
             (a.clone() - 1)
                 .mul(self.k_a.val().reshape([self.d_model]))
@@ -357,26 +385,15 @@ impl<B: Backend> TimeMix<B> {
         }
 
         let w = w + self.w0.val().reshape([self.d_model]);
-        let w = activation::sigmoid(w).mul_scalar(-0.606531).exp();
-
-        let vk = v
-            .clone()
-            .reshape([self.n_heads, self.head_size, 1])
-            .matmul(k.clone().reshape([self.n_heads, 1, self.head_size]));
-
-        let ab = (-kk.clone())
-            .reshape([self.n_heads, self.head_size, 1])
-            .matmul(kk.clone().mul(a).reshape([self.n_heads, 1, self.head_size]));
-
-        let vk_state = vk_state
-            .clone()
-            .mul(w.reshape([self.n_heads, 1, self.head_size]))
-            + vk_state.clone().matmul(ab)
-            + vk;
-
-        let out = vk_state
-            .clone()
-            .matmul(r.clone().reshape([self.n_heads, self.head_size, 1]));
+        let (out, vk_state) = self.wkv_op.forward_rnn(
+            r.clone(),
+            w,
+            k.clone(),
+            v.clone(),
+            -kk.clone(),
+            kk.clone().mul(a.clone()),
+            vk_state,
+        );
 
         let out = self
             .group_norm
@@ -397,116 +414,90 @@ impl<B: Backend> TimeMix<B> {
     }
 }
 
-/// A helper struct implementing the custom WKV attention operator.
-///
-/// Performs a time-recursive computation used for efficient memory-based attention,
-/// replacing standard softmax attention in RWKV models.
-#[derive(Module, Clone, Debug)]
-struct WKVv7 {
-    n_heads: usize,
-    head_size: usize,
+fn init_mix_vector<B: Backend>(device: &B::Device, d_model: usize, exponent: f32) -> Tensor<B, 3> {
+    let values = (0..d_model)
+        .map(|index| {
+            let position = index as f32 / d_model.max(1) as f32;
+            1.0 - position.powf(exponent.max(1e-6))
+        })
+        .collect::<Vec<_>>();
+
+    Tensor::<B, 1>::from_data(values.as_slice(), device).reshape([1, 1, d_model])
 }
 
-impl WKVv7 {
-    /// Creates a new instance of the WKVv7 operator.
-    ///
-    /// # Arguments
-    /// * `n_heads` - Number of attention heads.
-    /// * `head_size` - Size per attention head.
-    ///
-    /// # Returns
-    /// A new `WKVv7` struct.
-    fn new(n_heads: usize, head_size: usize) -> WKVv7 {
-        WKVv7 { n_heads, head_size }
-    }
+fn init_w0<B: Backend>(
+    device: &B::Device,
+    d_model: usize,
+    head_size: usize,
+    ratio_0_to_1: f32,
+) -> Tensor<B, 3> {
+    let denom = d_model.saturating_sub(1).max(1) as f32;
+    let head_denom = head_size.saturating_sub(1).max(1) as f32;
+    let values = (0..d_model)
+        .map(|index| {
+            let linear = index as f32 / denom;
+            let zigzag = if head_size > 1 {
+                let centered = ((index % head_size) as f32 - head_denom / 2.0) / (head_denom / 2.0);
+                centered * centered.abs()
+            } else {
+                0.0
+            };
+            let curve = -6.0 + 6.0 * linear.powf(1.0 + ratio_0_to_1.powf(0.3));
+            curve + 0.5 + zigzag * 2.5
+        })
+        .collect::<Vec<_>>();
 
-    /// Computes the weighted key-value aggregation over time using recursive computation.
-    ///
-    /// This function operates on reshaped 4D tensors and computes a form of time-aware
-    /// attention based on decaying state accumulation.
-    ///
-    /// # Arguments
-    /// * `r` - Receptance tensor of shape `[B, T, d_model]`.
-    /// * `w` - Decay weights tensor.
-    /// * `k` - Key tensor.
-    /// * `v` - Value tensor.
-    /// * `a` - Pre-activation attention modifier tensor.
-    /// * `b` - Attention booster tensor.
-    ///
-    /// # Returns
-    /// A tuple containing:
-    /// * Aggregated output tensor of shape `[B, T, d_model]`.
-    /// * State tensor of shape `[B, T, head_size, head_size]`, that can be used for further inference in RNN mode.
-    fn forward<B: Backend>(
-        self,
-        r: Tensor<B, 3>,
-        w: Tensor<B, 3>,
-        k: Tensor<B, 3>,
-        v: Tensor<B, 3>,
-        a: Tensor<B, 3>,
-        b: Tensor<B, 3>,
-    ) -> (Tensor<B, 3>, Tensor<B, 4>) {
-        let [batch_size, time_steps, d_model] = r.clone().dims();
+    Tensor::<B, 1>::from_data(values.as_slice(), device).reshape([1, 1, d_model])
+}
 
-        let r: Tensor<B, 4> = r.reshape([batch_size, time_steps, self.n_heads, self.head_size]);
-        let k: Tensor<B, 4> = k.reshape([batch_size, time_steps, self.n_heads, self.head_size]);
-        let v: Tensor<B, 4> = v.reshape([batch_size, time_steps, self.n_heads, self.head_size]);
-        let a: Tensor<B, 4> =
-            a.clone()
-                .reshape([batch_size, time_steps, self.n_heads, self.head_size]);
-        let b: Tensor<B, 4> = b.reshape([batch_size, time_steps, self.n_heads, self.head_size]);
-        let w: Tensor<B, 4> = Tensor::exp(-Tensor::exp(w.reshape([
-            batch_size,
-            time_steps,
-            self.n_heads,
-            self.head_size,
-        ])));
+fn init_a0<B: Backend>(device: &B::Device, d_model: usize, head_size: usize) -> Tensor<B, 3> {
+    let denom = d_model.saturating_sub(1).max(1) as f32;
+    let head_denom = head_size.saturating_sub(1).max(1) as f32;
+    let values = (0..d_model)
+        .map(|index| {
+            let linear = index as f32 / denom - 0.5;
+            let zigzag = if head_size > 1 {
+                let centered = ((index % head_size) as f32 - head_denom / 2.0) / (head_denom / 2.0);
+                centered * centered.abs()
+            } else {
+                0.0
+            };
+            -0.19 + zigzag * 0.3 + linear * 0.4
+        })
+        .collect::<Vec<_>>();
 
-        let mut out: Tensor<B, 4> = Tensor::zeros(
-            [batch_size, time_steps, self.n_heads, self.head_size],
-            &r.device(),
-        );
-        let mut state: Tensor<B, 4> = Tensor::zeros(
-            [batch_size, self.n_heads, self.head_size, self.head_size],
-            &r.device(),
-        );
+    Tensor::<B, 1>::from_data(values.as_slice(), device).reshape([1, 1, d_model])
+}
 
-        for t in 0..time_steps {
-            let kk =
-                k.clone()
-                    .slice(s![.., t])
-                    .reshape([batch_size, self.n_heads, 1, self.head_size]);
-            let rr =
-                r.clone()
-                    .slice(s![.., t])
-                    .reshape([batch_size, self.n_heads, self.head_size, 1]);
-            let vv =
-                v.clone()
-                    .slice(s![.., t])
-                    .reshape([batch_size, self.n_heads, self.head_size, 1]);
-            let aa =
-                a.clone()
-                    .slice(s![.., t])
-                    .reshape([batch_size, self.n_heads, self.head_size, 1]);
-            let bb =
-                b.clone()
-                    .slice(s![.., t])
-                    .reshape([batch_size, self.n_heads, 1, self.head_size]);
-            let ww =
-                w.clone()
-                    .slice(s![.., t])
-                    .reshape([batch_size, self.n_heads, 1, self.head_size]);
+fn init_v0<B: Backend>(device: &B::Device, d_model: usize) -> Tensor<B, 3> {
+    let denom = d_model.saturating_sub(1).max(1) as f32;
+    let values = (0..d_model)
+        .map(|index| 0.73 - (index as f32 / denom - 0.5) * 0.4)
+        .collect::<Vec<_>>();
 
-            state = state.clone().mul(ww) + state.clone().matmul(aa.matmul(bb)) + vv.matmul(kk);
+    Tensor::<B, 1>::from_data(values.as_slice(), device).reshape([1, 1, d_model])
+}
 
-            out = out.slice_assign(
-                [0..batch_size, t..t + 1, 0..self.n_heads, 0..self.head_size],
-                state
-                    .clone()
-                    .matmul(rr)
-                    .reshape([batch_size, 1, self.n_heads, self.head_size]),
-            );
-        }
-        (out.reshape([batch_size, time_steps, d_model]), state)
-    }
+fn init_kk<B: Backend>(device: &B::Device, d_model: usize) -> Tensor<B, 3> {
+    let denom = d_model.saturating_sub(1).max(1) as f32;
+    let values = (0..d_model)
+        .map(|index| 0.71 - (index as f32 / denom - 0.5) * 0.1)
+        .collect::<Vec<_>>();
+
+    Tensor::<B, 1>::from_data(values.as_slice(), device).reshape([1, 1, d_model])
+}
+
+fn init_constant_1x1<B: Backend>(device: &B::Device, d_model: usize, value: f32) -> Tensor<B, 3> {
+    let values = vec![value; d_model];
+    Tensor::<B, 1>::from_data(values.as_slice(), device).reshape([1, 1, d_model])
+}
+
+fn init_constant_2d<B: Backend>(
+    device: &B::Device,
+    rows: usize,
+    cols: usize,
+    value: f32,
+) -> Tensor<B, 2> {
+    let values = vec![value; rows * cols];
+    Tensor::<B, 1>::from_data(values.as_slice(), device).reshape([rows, cols])
 }

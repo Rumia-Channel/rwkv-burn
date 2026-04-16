@@ -66,14 +66,6 @@ impl<'a, B: Backend> Generator<'a, B> {
         self.inference_mode = inference_mode;
     }
 
-    /// Returns the current inference mode.
-    ///
-    /// # Returns
-    /// The current `InferenceMode` being used.
-    pub fn get_inference_mode(&self) -> InferenceMode {
-        self.inference_mode
-    }
-
     /// Generates text based on the given prompt and maximum token count.
     ///
     /// Chooses the forward path (parallel or sequential) depending on the selected
@@ -244,10 +236,10 @@ impl<'a, B: Backend> Generator<'a, B> {
 
         let mut out = prompt.to_string();
         let mut state: Vec<LayerState<B>> = Vec::<LayerState<B>>::with_capacity(self.model.layers.len());
-        let mut y = Tensor::<B, 3>::empty([1,1,1], &self.model.embed.weight.device());
 
         for _ in 0..max_new_tokens {
             let x = self.prompt_to_tensor(&out);
+            let y;
             (y, state) = self.model.forward_parallel(x);
             if let (Ok(string), token, _) = self.sample_next_token(y.reshape([-1])) {
                 out += &string;

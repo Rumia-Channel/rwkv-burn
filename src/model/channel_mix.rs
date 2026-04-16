@@ -38,7 +38,7 @@ impl<B: Backend> ChannelMix<B> {
     /// A new instance of `ChannelMix`.
     pub fn new(device: &B::Device, d_model: usize) -> ChannelMix<B> {
         let dim_ffn = 4 * d_model;
-        let x_k = Param::from_tensor(Tensor::<B, 3>::empty([1, 1, d_model], device));
+        let x_k = Param::from_tensor(init_channel_mix_xk::<B>(device, d_model));
         let key = LinearConfig::new(d_model, dim_ffn)
             .with_bias(false)
             .init::<B>(device);
@@ -104,4 +104,15 @@ impl<B: Backend> ChannelMix<B> {
 
         (self.value.forward(k), x)
     }
+}
+
+fn init_channel_mix_xk<B: Backend>(device: &B::Device, d_model: usize) -> Tensor<B, 3> {
+    let values = (0..d_model)
+        .map(|index| {
+            let position = index as f32 / d_model.max(1) as f32;
+            1.0 - position
+        })
+        .collect::<Vec<_>>();
+
+    Tensor::<B, 1>::from_data(values.as_slice(), device).reshape([1, 1, d_model])
 }

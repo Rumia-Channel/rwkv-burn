@@ -108,7 +108,7 @@ fn get_tensor<B: Backend, const D: usize>(
     device: &B::Device,
 ) -> Tensor<B, D> {
     let tensor_view = safetensors.tensor(name).unwrap();
-    let tensor_data = TensorData::from_bytes(
+    let tensor_data = TensorData::from_bytes_vec(
         tensor_view.data().to_vec(),
         Shape::from(tensor_view.shape().to_vec()),
         burn::tensor::DType::BF16,
@@ -140,11 +140,12 @@ fn apply_weights<B: Backend>(safetensors: SafeTensors, model: &mut RWKVv7<B>, de
     model.layer_norm_in.gamma =
         Param::from_tensor(get_tensor(&safetensors, "blocks.0.ln0.weight", device));
     model.layer_norm_in.beta =
-        Param::from_tensor(get_tensor(&safetensors, "blocks.0.ln0.bias", device));
+        Some(Param::from_tensor(get_tensor(&safetensors, "blocks.0.ln0.bias", device)));
 
     model.layer_norm_out.gamma =
         Param::from_tensor(get_tensor(&safetensors, "ln_out.weight", device));
-    model.layer_norm_out.beta = Param::from_tensor(get_tensor(&safetensors, "ln_out.bias", device));
+    model.layer_norm_out.beta =
+        Some(Param::from_tensor(get_tensor(&safetensors, "ln_out.bias", device)));
 
     /*************************
      * Handle Blocks
@@ -168,22 +169,22 @@ fn apply_weights<B: Backend>(safetensors: SafeTensors, model: &mut RWKVv7<B>, de
             &format!("blocks.{}.ln1.weight", block_id),
             device,
         ));
-        model.layers[*block_id].layer_norm_1.beta = Param::from_tensor(get_tensor(
+        model.layers[*block_id].layer_norm_1.beta = Some(Param::from_tensor(get_tensor(
             &safetensors,
             &format!("blocks.{}.ln1.bias", block_id),
             device,
-        ));
+        )));
 
         model.layers[*block_id].layer_norm_2.gamma = Param::from_tensor(get_tensor(
             &safetensors,
             &format!("blocks.{}.ln2.weight", block_id),
             device,
         ));
-        model.layers[*block_id].layer_norm_2.beta = Param::from_tensor(get_tensor(
+        model.layers[*block_id].layer_norm_2.beta = Some(Param::from_tensor(get_tensor(
             &safetensors,
             &format!("blocks.{}.ln2.bias", block_id),
             device,
-        ));
+        )));
 
         // time mixing
         model.layers[*block_id].tmix.x_r = Param::from_tensor(get_tensor(

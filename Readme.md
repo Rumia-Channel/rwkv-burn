@@ -1,4 +1,4 @@
-# RWKVv7 CLI Inference (Burn Framework)
+# RWKVv7 Inference + Training (Burn Framework)
 
 > A port of the [RWKV v7](https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v7) language model (100% attention free), implemented in [Rust](https://www.rust-lang.org/) with the [Burn](https://burn.dev) deep learning framework.
 
@@ -11,10 +11,13 @@
 ## ✨ Features
 
 - 🔥 **Pure Burn**: built with [Burn](https://burn.dev)
+- ⚡ **CubeCL-ready backend path**: upgraded to Burn `0.20.1` with WGPU / CubeCL-oriented execution
 - 🔤 **Tokenizer** support via [`rwkv-tokenizer`](https://crates.io/crates/rwkv-tokenizer)
 - 🧠 Supports **stateful sequential** or **parallel generation** or **mixed generation**
 - 🧪 Sampling with **top-k**, **temperature**, and **top-p**
 - ⚙️ Load RWKV v7 models from [`safetensors`](https://github.com/huggingface/safetensors)
+- 🏋️ **In-repo training** on text corpora or sample-compatible `binidx` datasets
+- 💾 **Burn checkpoints** for continuing training and reusing trained models in inference
 
 ---
 
@@ -57,13 +60,47 @@ wget https://huggingface.co/BlinkDL/rwkv-7-world/resolve/main/RWKV-x070-World-0.
 python weights_to_safetensors.py RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth
 ```
 
-### Run the CLI
+### Run interactive inference from safetensors
 
 ```bash
 cargo run --release -- \
   --weights /path/to/model_weights.pth.safetensors \
-  --top_p 0.6
+  --top_p 0.6 \
   --temperature 0.8
+```
+
+### Continue inference from a trained Burn checkpoint
+
+```bash
+cargo run --release -- \
+  --checkpoint_dir artifacts/rwkv-train
+```
+
+### Train on a plain text corpus
+
+```bash
+cargo run --release -- \
+  --train \
+  --data_file sample.txt \
+  --dataset_format text \
+  --ctx_len 256 \
+  --batch_size 4 \
+  --train_steps 1000 \
+  --learning_rate 1e-4 \
+  --checkpoint_dir artifacts/rwkv-train
+```
+
+### Train on a sample-compatible binidx dataset
+
+```bash
+cargo run --release -- \
+  --train \
+  --data_file data/my_corpus \
+  --dataset_format binidx \
+  --ctx_len 256 \
+  --batch_size 4 \
+  --magic_prime 104729 \
+  --checkpoint_dir artifacts/rwkv-train
 ```
 
 ## ⚙️ CLI Options
@@ -78,18 +115,32 @@ cargo run --release -- \
 | `-t`, `--temperature`       | Temperature for token sampling        | `0.6`       |
 | `-p`, `--top_p`             | Top-p sampling parameter              | `0.6`       |
 | `-k`, `--top_k`             | Top-k sampling parameter              | `50`        |
+| `--checkpoint_dir`          | Burn checkpoint directory             | _optional_  |
+| `--max_new_tokens`          | Max generated tokens per reply        | `64`        |
 | `--inference_mode`          | Parallel, RNN, Mixed                  | `Mixed`     |
 | `--tokenizer_vocab_file`    | Path to tokenizer vocab file          | `rwkv_vocab_v20230424.txt` |
+| `--train`                   | Enable training mode                  | `false`     |
+| `--data_file`               | Training corpus path                  | _optional_  |
+| `--dataset_format`          | `text` or `binidx`                    | `text`      |
+| `--ctx_len`                 | Training context length               | `256`       |
+| `--batch_size`              | Training batch size                   | `4`         |
+| `--train_steps`             | Training steps                        | `1000`      |
+| `--learning_rate`           | Training learning rate                | `1e-4`      |
+| `--checkpoint_every`        | Checkpoint interval                   | `100`       |
+| `--seed`                    | Training RNG seed                     | `42`        |
+| `--magic_prime`             | Deterministic RWKV dataset schedule   | _optional_  |
 
 
 ## 🛠️ Developer Notes
 
-This project implements a minimal RWKV-v7 model inference pipeline using the [Burn](https://burn.dev) deep learning framework and [rwkv-tokenizer](github.com/cahya-wirawan/rwkv-tokenizer) for tokenization.
+This project implements an RWKV-v7 inference and training pipeline using the [Burn](https://burn.dev) deep learning framework and [rwkv-tokenizer](github.com/cahya-wirawan/rwkv-tokenizer) for tokenization.
 
 ### Structure
 
-- `main.rs`: Entry point with CLI parsing and REPL loop.
+- `main.rs`: Entry point for inference and training modes.
+- `data.rs`: Text / binidx training corpus loading.
 - `model`: Implements the RWKVv7 model architecture using `burn` modules.
+- `training.rs`: Burn autodiff training loop and checkpoint management.
 - `generator.rs`: Handles text generation (sequential and parallel modes).
 - `rwkv_vocab_v20230424.txt`: Vocabulary file used by the tokenizer.
 - `weights_to_safetensors.py`: Optional script to convert pre-trained weights into `.safetensors` format.
@@ -97,9 +148,11 @@ This project implements a minimal RWKV-v7 model inference pipeline using the [Bu
 ### Supported Features
 
 - 🔄 RNN-style token-by-token generation
-- 🔥 Top-k andTop-p sampling
+- 🔥 Top-k and top-p sampling
 - 🧠 Inference state caching across generations
 - 🎛 CLI configuration for model size, heads, tokenizer, weights
+- 🏋️ Training with Burn autodiff and checkpoint reuse
+- ⚙️ WKV kernel abstraction prepared for CubeCL-oriented optimization work
 
 
 ### 🛤️ Roadmap

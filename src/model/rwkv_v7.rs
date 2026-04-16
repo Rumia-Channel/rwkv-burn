@@ -102,6 +102,21 @@ pub struct RWKVv7<B: Backend> {
 }
 
 impl<B: Backend> RWKVv7<B> {
+    pub fn config(&self) -> RWKVv7Config {
+        let layer = &self.layers[0];
+        RWKVv7Config::new(
+            self.d_model,
+            self.n_heads,
+            self.head_size,
+            self.layers.len(),
+            self.embed.weight.val().dims()[0],
+        )
+        .with_d_decay_lora(layer.d_decay_lora)
+        .with_d_aaa_lora(layer.d_aaa_lora)
+        .with_d_mv_lora(layer.d_mv_lora)
+        .with_d_gate_lora(layer.d_gate_lora)
+    }
+
     /// Creates a new RWKVv7 model with the given configuration.
     ///
     /// # Arguments
@@ -174,7 +189,10 @@ impl<B: Backend> RWKVv7<B> {
     /// # Returns
     ///
     /// A 3D tensor with shape `[batch_size, seq_len, vocab_size]` containing the model logits.
-    pub fn forward_parallel(&mut self, x: Tensor<B, 2, burn::tensor::Int>) -> (Tensor<B, 3>, Vec<LayerState<B>>) {
+    pub fn forward_parallel_logits(
+        &mut self,
+        x: Tensor<B, 2, burn::tensor::Int>,
+    ) -> (Tensor<B, 3>, Vec<LayerState<B>>) {
         let x = self.embed.forward(x);
 
         let mut x = self.layer_norm_in.forward(x);
@@ -188,11 +206,15 @@ impl<B: Backend> RWKVv7<B> {
 
         let x = self.layer_norm_out.forward(x);
 
-        // return the logits for the last token (which is the prediction of the new token) 
-        (
-            self.unembed.forward(x.slice(s![.., -1])),
-            layer_states
-        )
+        (self.unembed.forward(x), layer_states)
+    }
+
+    pub fn forward_parallel(
+        &mut self,
+        x: Tensor<B, 2, burn::tensor::Int>,
+    ) -> (Tensor<B, 3>, Vec<LayerState<B>>) {
+        let (logits, layer_states) = self.forward_parallel_logits(x);
+        (logits.slice(s![.., -1]), layer_states)
     }
 
     /// Runs a forward pass on a single token in RNN-style inference.

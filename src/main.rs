@@ -1,38 +1,57 @@
+mod data;
 mod generator;
 mod model;
+mod training;
 
-use burn::{
-    backend::{NdArray, Wgpu, LibTorch},
-    prelude::*,
+use std::{
+    io::{self, Write},
+    path::PathBuf,
 };
 
-use clap::{Parser, command};
+use anyhow::{Context, Result, bail};
+use burn::{
+    backend::{Autodiff, Wgpu},
+    config::Config as BurnConfig,
+    prelude::*,
+    record::CompactRecorder,
+};
+use clap::{Parser, ValueEnum};
 use generator::InferenceMode;
-use std::io;
-use std::io::{Read, Write};
-
 use rwkv_tokenizer::WorldTokenizer;
 
-use crate::generator::Generator;
-use crate::model::{RWKVv7, RWKVv7Config};
+use crate::{
+    data::DatasetFormat,
+    generator::Generator,
+    model::{RWKVv7, RWKVv7Config},
+    training::TrainingConfig,
+};
 
-/// Command-line configuration for loading and running an RWKVv7 language model.
-///
-/// Users can specify model architecture parameters, tokenizer path, weights file,
-/// and sampling configuration.
-///
-/// Example usage:
-/// ```sh
-/// cargo run -- --n_layer 12 --d_model 768 --n_heads 12 --vocab_size 65536 \
-///     --tokenizer_vocab_file ./vocab.txt --weights ./model.safetensors
-/// ```
+#[derive(ValueEnum, Clone, Debug)]
+enum DatasetFormatArg {
+    Text,
+    Binidx,
+}
+
+impl From<DatasetFormatArg> for DatasetFormat {
+    fn from(value: DatasetFormatArg) -> Self {
+        match value {
+            DatasetFormatArg::Text => DatasetFormat::Text,
+            DatasetFormatArg::Binidx => DatasetFormat::BinIdx,
+        }
+    }
+}
+
+/// Command-line configuration for loading, training and running an RWKVv7 language model.
 #[derive(Parser, Debug)]
 #[command(
     version = "0.1.0",
     author = "dymat",
-    about = "Create RWKVv7 model and load weights."
+    about = "Run inference or train RWKVv7 with Burn + CubeCL backends."
 )]
 struct Config {
+    #[arg(long, help = "Enable language-model training mode")]
+    train: bool,
+
     #[arg(
         short = 'l',
         long = "n_layer",
@@ -61,23 +80,25 @@ struct Config {
         short = 'v',
         long = "vocab_size",
         default_value_t = 65536,
-        help = "Vocab size"
+        help = "Vocabulary size"
     )]
     vocab_size: usize,
 
     #[arg(
         long = "tokenizer_vocab_file",
         default_value_t = String::from("rwkv_vocab_v20230424.txt"),
-        help = "Path to tokenizer vocab file (rwkv_vocab_v20230424.txt)"
+        help = "Path to tokenizer vocab file"
     )]
     vocab_path: String,
 
-    #[arg(
-        short = 'w',
-        long = "weights",
-        help = "Path to safetensors weight file"
-    )]
+    #[arg(short = 'w', long = "weights", help = "Path to safetensors weight file")]
     weights: Option<String>,
+
+    #[arg(
+        long = "checkpoint_dir",
+        help = "Path to a Burn checkpoint directory for loading or saving trained models"
+    )]
+    checkpoint_dir: Option<String>,
 
     #[arg(
         short = 't',
@@ -91,7 +112,7 @@ struct Config {
         short = 'p',
         long = "top_p",
         default_value_t = 0.6,
-        help = "Top p for token sampling (nucleus)"
+        help = "Top-p sampling parameter"
     )]
     top_p: f32,
 
@@ -99,76 +120,149 @@ struct Config {
         short = 'k',
         long = "top_k",
         default_value_t = 50,
-        help = "Top k for token sampling"
+        help = "Top-k sampling parameter"
     )]
     top_k: usize,
 
     #[arg(
+        long = "max_new_tokens",
+        default_value_t = 64,
+        help = "Maximum number of tokens to generate per reply"
+    )]
+    max_new_tokens: usize,
+
+    #[arg(
         long = "inference_mode",
         default_value_t = String::from("Mixed"),
-        help = "use >Parallel< mode for inference (slower) or >RNN< mode. Default is >Mixed<."
+        help = "Inference mode: Parallel, Sequential or Mixed"
     )]
     inference_mode: String,
+
+    #[arg(long = "data_file", help = "Training corpus path")]
+    data_file: Option<String>,
+
+    #[arg(
+        long = "dataset_format",
+        value_enum,
+        default_value_t = DatasetFormatArg::Text,
+        help = "Training corpus format"
+    )]
+    dataset_format: DatasetFormatArg,
+
+    #[arg(long = "ctx_len", default_value_t = 256, help = "Training context length")]
+    ctx_len: usize,
+
+    #[arg(long = "batch_size", default_value_t = 4, help = "Training batch size")]
+    batch_size: usize,
+
+    #[arg(long = "train_steps", default_value_t = 1000, help = "Number of training steps")]
+    train_steps: usize,
+
+    #[arg(
+        long = "learning_rate",
+        default_value_t = 1e-4,
+        help = "Training learning rate"
+    )]
+    learning_rate: f64,
+
+    #[arg(
+        long = "checkpoint_every",
+        default_value_t = 100,
+        help = "Save a checkpoint every N training steps"
+    )]
+    checkpoint_every: usize,
+
+    #[arg(long = "seed", default_value_t = 42, help = "Training RNG seed")]
+    seed: u64,
+
+    #[arg(
+        long = "magic_prime",
+        help = "Sample-compatible prime for deterministic RWKV dataset scheduling"
+    )]
+    magic_prime: Option<u64>,
 }
 
-/// Entry point for the CLI application that loads an RWKVv7 model,
-/// initializes a tokenizer, and enables interactive text generation.
-///
-/// Supports:
-/// - Loading weights from safetensors
-/// - Resetting state with `\reset`
-/// - Exiting with `\exit`
-/// - Sampling output using top-k filtering
-fn main() {
-    let config = Config::parse(); // Parse command-line args
-
-    // Select the backend (NdArray for CPU, can swap for Cuda/Wgpu)
-    type MyBackend = LibTorch;
-    let device = Default::default();
-
-    // Initialize the model either from weights or config
-    let model: RWKVv7<MyBackend>;
-    if let Some(weight_path) = config.weights {
-        model = RWKVv7::<MyBackend>::new_from_safetensors(&weight_path, &device);
-    } else {
-        let head_size = config.d_model / config.n_heads;
-        model = RWKVv7Config::new(
-            config.d_model,
-            config.n_heads,
-            head_size,
-            config.n_layer,
-            config.vocab_size,
+impl Config {
+    fn model_config(&self) -> RWKVv7Config {
+        RWKVv7Config::new(
+            self.d_model,
+            self.n_heads,
+            self.d_model / self.n_heads,
+            self.n_layer,
+            self.vocab_size,
         )
-        .init::<MyBackend>(&device);
     }
 
-    // Load tokenizer from specified vocab file
-    let tokenizer =
-        WorldTokenizer::new(Some(&config.vocab_path)).expect("Expected to load the tokenizer.");
+    fn training_config(&self) -> Result<TrainingConfig> {
+        let data_path = self
+            .data_file
+            .clone()
+            .context("--data_file is required in training mode")?;
 
-    // Create text generator using the model and tokenizer
+        if self.d_model % self.n_heads != 0 {
+            bail!("d_model must be divisible by n_heads");
+        }
+
+        Ok(TrainingConfig {
+            weights: self.weights.clone(),
+            checkpoint_dir: self.checkpoint_dir.clone(),
+            data_path,
+            dataset_format: self.dataset_format.clone().into(),
+            n_layer: self.n_layer,
+            d_model: self.d_model,
+            n_heads: self.n_heads,
+            vocab_size: self.vocab_size,
+            ctx_len: self.ctx_len,
+            batch_size: self.batch_size,
+            steps: self.train_steps,
+            learning_rate: self.learning_rate,
+            checkpoint_every: self.checkpoint_every,
+            seed: self.seed,
+            magic_prime: self.magic_prime,
+        })
+    }
+}
+
+fn main() -> Result<()> {
+    let config = Config::parse();
+
+    if config.train {
+        run_training(&config)
+    } else {
+        run_generate(&config)
+    }
+}
+
+fn run_generate(config: &Config) -> Result<()> {
+    type BackendImpl = Wgpu;
+
+    let device = Default::default();
+    let model = load_or_init_model::<BackendImpl>(config, &device)?;
+    let tokenizer =
+        WorldTokenizer::new(Some(&config.vocab_path)).context("failed to load tokenizer")?;
+
     let mut generator = Generator::new(
-        model.clone(), 
-        &tokenizer, 
+        model.clone(),
+        &tokenizer,
         config.temperature,
         config.top_p,
-        config.top_k
+        config.top_k,
     );
-    
+
     match config.inference_mode.to_lowercase().as_str() {
         "mixed" => generator.set_inference_mode(InferenceMode::Mixed),
         "parallel" => generator.set_inference_mode(InferenceMode::Parallel),
         "sequential" => generator.set_inference_mode(InferenceMode::Sequential),
-        &_ => {
-            println!("Inference Mode '{}' not implemented! Falling back to 'Mixed'", config.inference_mode);
+        _ => {
+            println!(
+                "Inference mode '{}' not implemented. Falling back to 'Mixed'.",
+                config.inference_mode
+            );
             generator.set_inference_mode(InferenceMode::Mixed);
-        },
+        }
     };
 
-    // Initial RNN state (will be updated through interaction)
     let mut state = None;
-
-    // Interactive loop
     loop {
         print!("User: ");
         let _ = io::stdout().flush();
@@ -178,27 +272,62 @@ fn main() {
             Ok(_) => {
                 let trimmed_input = input.trim();
 
-                // Exit command
                 if trimmed_input.eq_ignore_ascii_case("\\exit") {
                     break;
                 }
 
-                // Reset command
                 if trimmed_input.eq_ignore_ascii_case("\\reset") {
                     state = Some(model.get_init_state());
                     println!("Resetting internal model state.");
                     continue;
                 }
 
-                // Generate response
                 print!("Assistant: ");
                 let _ = io::stdout().flush();
 
-                (_, state) = generator.generate(trimmed_input, 64, state);
+                (_, state) = generator.generate(trimmed_input, config.max_new_tokens, state);
             }
-            Err(e) => println!("Could not read input: {}", e),
+            Err(err) => println!("Could not read input: {err}"),
         }
 
-        println!("\n");
+        println!();
+        println!();
     }
+
+    Ok(())
+}
+
+fn run_training(config: &Config) -> Result<()> {
+    type BackendImpl = Autodiff<Wgpu>;
+
+    let device = Default::default();
+    let tokenizer =
+        WorldTokenizer::new(Some(&config.vocab_path)).context("failed to load tokenizer")?;
+    let training_config = config.training_config()?;
+
+    training::train::<BackendImpl>(&training_config, &tokenizer, device)
+}
+
+fn load_or_init_model<B: Backend>(config: &Config, device: &B::Device) -> Result<RWKVv7<B>> {
+    if let Some(checkpoint_dir) = config.checkpoint_dir.as_deref() {
+        let checkpoint_dir = PathBuf::from(checkpoint_dir);
+        let config_path = checkpoint_dir.join("model-config.json");
+        let record_path = checkpoint_dir.join("model");
+
+        if config_path.exists() && record_path.with_extension("mpk").exists() {
+            let model_config = RWKVv7Config::load(&config_path)
+                .with_context(|| format!("failed to load {}", config_path.display()))?;
+            let model = model_config
+                .init::<B>(device)
+                .load_file(record_path, &CompactRecorder::new(), device)
+                .context("failed to load Burn checkpoint")?;
+            return Ok(model);
+        }
+    }
+
+    if let Some(weight_path) = config.weights.as_deref() {
+        return Ok(RWKVv7::<B>::new_from_safetensors(weight_path, device));
+    }
+
+    Ok(config.model_config().init::<B>(device))
 }

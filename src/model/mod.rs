@@ -1,4 +1,5 @@
 mod channel_mix;
+mod kernels;
 mod layer;
 mod load_from_safetensors;
 mod rwkv_v7;
