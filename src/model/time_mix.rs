@@ -5,7 +5,10 @@ use burn::{
     tensor::{Tensor, activation},
 };
 
-use super::kernels::WkvKernel;
+use super::{
+    kernels::WkvKernel,
+    trace::TensorSnapshot,
+};
 
 /// A module implementing the TimeMix layer for sequential processing.
 ///
@@ -411,6 +414,134 @@ impl<B: Backend> TimeMix<B> {
         let out = self.output.forward(out.mul(g));
 
         (out, x, vk_state, v_first)
+    }
+
+    pub fn forward_rnn_traced(
+        &self,
+        x: Tensor<B, 1>,
+        x_prev: Tensor<B, 1>,
+        mut v_first: Option<Tensor<B, 1>>,
+        vk_state: Tensor<B, 3>,
+    ) -> (
+        Tensor<B, 1>,
+        Tensor<B, 1>,
+        Tensor<B, 3>,
+        Option<Tensor<B, 1>>,
+        Vec<TensorSnapshot>,
+    ) {
+        let x = x.reshape([self.d_model]);
+        let x_prev = x_prev.reshape([self.d_model]);
+        let mut trace = Vec::new();
+
+        trace.push(TensorSnapshot::from_tensor("tmix_input", &x));
+        trace.push(TensorSnapshot::from_tensor("tmix_x_prev", &x_prev));
+        trace.push(TensorSnapshot::from_tensor("tmix_vk_state_in", &vk_state));
+
+        let xx = x_prev.clone() - x.clone();
+        trace.push(TensorSnapshot::from_tensor("tmix_xx", &xx));
+
+        let xr = x.clone() + xx.clone().mul(self.x_r.val().reshape([self.d_model]));
+        let xw = x.clone() + xx.clone().mul(self.x_w.val().reshape([self.d_model]));
+        let xk = x.clone() + xx.clone().mul(self.x_k.val().reshape([self.d_model]));
+        let xv = x.clone() + xx.clone().mul(self.x_v.val().reshape([self.d_model]));
+        let xa = x.clone() + xx.clone().mul(self.x_a.val().reshape([self.d_model]));
+        let xg = x.clone() + xx.clone().mul(self.x_g.val().reshape([self.d_model]));
+
+        trace.push(TensorSnapshot::from_tensor("tmix_xr", &xr));
+        trace.push(TensorSnapshot::from_tensor("tmix_xw", &xw));
+        trace.push(TensorSnapshot::from_tensor("tmix_xk", &xk));
+        trace.push(TensorSnapshot::from_tensor("tmix_xv", &xv));
+        trace.push(TensorSnapshot::from_tensor("tmix_xa", &xa));
+        trace.push(TensorSnapshot::from_tensor("tmix_xg", &xg));
+
+        let r = self.receptance.forward(xr);
+        let w_delta = self.w2.forward(activation::tanh(self.w1.forward(xw)));
+        let k_raw = self.key.forward(xk);
+        let mut v = self.value.forward(xv.clone());
+        let a = activation::sigmoid(
+            self.a0.val().reshape([self.d_model]) + self.a2.forward(self.a1.forward(xa)),
+        );
+        let g = self.g2.forward(activation::sigmoid(self.g1.forward(xg)));
+
+        trace.push(TensorSnapshot::from_tensor("tmix_r", &r));
+        trace.push(TensorSnapshot::from_tensor("tmix_w_delta", &w_delta));
+        trace.push(TensorSnapshot::from_tensor("tmix_k_raw", &k_raw));
+        trace.push(TensorSnapshot::from_tensor("tmix_v_raw", &v));
+        trace.push(TensorSnapshot::from_tensor("tmix_a", &a));
+        trace.push(TensorSnapshot::from_tensor("tmix_g", &g));
+
+        let kk = k_raw.clone().mul(self.k_k.val().reshape([self.d_model]));
+        let kk = kk.reshape([self.n_heads, self.head_size]);
+        let kk = kk
+            .clone()
+            .div(
+                kk.clone()
+                    .mul(kk.clone())
+                    .sum_dim(1)
+                    .add_scalar(1e-12)
+                    .sqrt()
+                    .reshape([self.n_heads, 1]),
+            )
+            .reshape([self.d_model]);
+        let k = k_raw.clone().mul(
+            (a.clone() - 1)
+                .mul(self.k_a.val().reshape([self.d_model]))
+                .add_scalar(1.0),
+        );
+
+        trace.push(TensorSnapshot::from_tensor("tmix_kk", &kk));
+        trace.push(TensorSnapshot::from_tensor("tmix_k", &k));
+
+        if let Some(_v_first) = v_first.clone() {
+            v = v.clone()
+                + (_v_first - v.clone()).mul(activation::sigmoid(
+                    self.v0.val().reshape([self.d_model])
+                        + self.v2.forward(self.v1.forward(xv.clone())),
+                ));
+        } else {
+            v_first = Some(v.clone());
+        }
+
+        trace.push(TensorSnapshot::from_tensor("tmix_v", &v));
+        if let Some(v_first) = v_first.as_ref() {
+            trace.push(TensorSnapshot::from_tensor("tmix_v_first", v_first));
+        }
+
+        let w = w_delta + self.w0.val().reshape([self.d_model]);
+        let w_decay = activation::sigmoid(w.clone()).mul_scalar(-0.606531).exp();
+        trace.push(TensorSnapshot::from_tensor("tmix_w_input", &w));
+        trace.push(TensorSnapshot::from_tensor("tmix_w_decay", &w_decay));
+
+        let (out, vk_state) = self.wkv_op.forward_rnn(
+            r.clone(),
+            w,
+            k.clone(),
+            v.clone(),
+            -kk.clone(),
+            kk.clone().mul(a.clone()),
+            vk_state,
+        );
+        trace.push(TensorSnapshot::from_tensor("tmix_wkv_out", &out));
+        trace.push(TensorSnapshot::from_tensor("tmix_vk_state_out", &vk_state));
+
+        let out = self
+            .group_norm
+            .forward(out.reshape([1, self.d_model]))
+            .reshape([self.d_model]);
+        trace.push(TensorSnapshot::from_tensor("tmix_post_group_norm", &out));
+
+        let out = out
+            + r.mul(k)
+                .mul(self.r_k.val().reshape([self.d_model]))
+                .reshape([self.n_heads, self.head_size])
+                .sum_dim(1)
+                .mul(v.reshape([self.n_heads, self.head_size]))
+                .reshape([self.d_model]);
+
+        let out = self.output.forward(out.mul(g));
+        trace.push(TensorSnapshot::from_tensor("tmix_output", &out));
+
+        (out, x, vk_state, v_first, trace)
     }
 }
 

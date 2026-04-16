@@ -21,6 +21,14 @@
 
 Inference now defaults to **LibTorch** for numerical stability, while training stays on the Burn autodiff + WGPU path.
 
+For backend debugging, you can compare **LibTorch** and **WGPU** intermediate tensors on the same prompt:
+
+```bash
+cargo run -- --weights RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth.safetensors --parity_check --parity_prompt "Hello" --parity_max_tokens 24
+```
+
+Add `--parity_verbose` to print per-layer tensor diffs for `TimeMix` / WKV internals.
+
 ---
 
 ## Help wanted

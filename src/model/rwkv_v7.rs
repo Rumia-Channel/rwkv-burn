@@ -5,7 +5,10 @@ use burn::{
     tensor::Tensor,
 };
 
-use super::layer::{Layer, LayerState};
+use super::{
+    layer::{Layer, LayerState},
+    trace::StepTrace,
+};
 
 /// Configuration struct for the RWKVv7 model.
 ///
@@ -256,6 +259,50 @@ impl<B: Backend> RWKVv7<B> {
         }
 
         (self.unembed.forward(self.layer_norm_out.forward(x)), state)
+    }
+
+    pub fn forward_rnn_traced(
+        &mut self,
+        token: i32,
+        mut state: Vec<LayerState<B>>,
+        token_index: usize,
+    ) -> (Tensor<B, 1>, Vec<LayerState<B>>, StepTrace) {
+        let embed = self
+            .embed
+            .weight
+            .val()
+            .clone()
+            .slice(token)
+            .reshape([self.d_model]);
+        let mut trace = StepTrace::new(token_index, token);
+        trace.push("model_embed", &embed);
+
+        let mut x = self.layer_norm_in.forward(embed);
+        trace.push("model_layer_norm_in", &x);
+        let mut v_first: Option<Tensor<B, 1>> = None;
+
+        for i in 0..self.layers.len() {
+            let layer_state: LayerState<B>;
+            let layer_trace;
+            (x, v_first, layer_state, layer_trace) = self.layers[i].forward_rnn_traced(
+                x,
+                v_first,
+                state[i].tmix_x_prev.clone().reshape([self.d_model]),
+                state[i].tmix_kv.clone(),
+                state[i].cmix_x_prev.clone().reshape([self.d_model]),
+            );
+
+            state[i] = layer_state;
+            trace.layers.push(layer_trace);
+        }
+
+        let x = self.layer_norm_out.forward(x);
+        trace.push("model_layer_norm_out", &x);
+
+        let logits = self.unembed.forward(x);
+        trace.push("model_logits", &logits);
+
+        (logits, state, trace)
     }
 
     /// Returns the initial hidden state for each transformer layer.

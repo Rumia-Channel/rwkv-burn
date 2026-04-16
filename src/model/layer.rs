@@ -4,7 +4,11 @@ use burn::{
     tensor::Tensor,
 };
 
-use super::{channel_mix::ChannelMix, time_mix::TimeMix};
+use super::{
+    channel_mix::ChannelMix,
+    time_mix::TimeMix,
+    trace::LayerTrace,
+};
 
 /// Stores the internal recurrent state for a transformer layer.
 ///
@@ -206,6 +210,46 @@ impl<B: Backend> Layer<B> {
                 tmix_kv: vk_state,
                 cmix_x_prev: cmix_x_prev.reshape([1, 1, self.d_model]),
             },
+        )
+    }
+
+    pub fn forward_rnn_traced(
+        &self,
+        x: Tensor<B, 1>,
+        v_first: Option<Tensor<B, 1>>,
+        tmix_x_prev: Tensor<B, 1>,
+        tmix_vk_state: Tensor<B, 3>,
+        cmix_x_prev: Tensor<B, 1>,
+    ) -> (Tensor<B, 1>, Option<Tensor<B, 1>>, LayerState<B>, LayerTrace) {
+        let mut trace = LayerTrace::new(self.layer_id);
+
+        let x_normed = self.layer_norm_1.forward(x.clone());
+        trace.push("layer_norm_1", &x_normed);
+
+        let (tmix_out, tmix_x_prev, vk_state, v_first, tmix_trace) =
+            self.tmix
+                .forward_rnn_traced(x_normed, tmix_x_prev, v_first, tmix_vk_state);
+        trace.extend(tmix_trace);
+
+        let x = x + tmix_out;
+        trace.push("layer_after_tmix_residual", &x);
+
+        let x_normed = self.layer_norm_2.forward(x.clone());
+        trace.push("layer_norm_2", &x_normed);
+
+        let (cmix_out, cmix_x_prev) = self.cmix.forward_rnn(x_normed, cmix_x_prev);
+        let x = x + cmix_out;
+        trace.push("layer_output", &x);
+
+        (
+            x,
+            v_first,
+            LayerState::<B> {
+                tmix_x_prev: tmix_x_prev.reshape([1, 1, self.d_model]),
+                tmix_kv: vk_state,
+                cmix_x_prev: cmix_x_prev.reshape([1, 1, self.d_model]),
+            },
+            trace,
         )
     }
 }

@@ -1,6 +1,7 @@
 mod data;
 mod generator;
 mod model;
+mod parity;
 mod training;
 
 use std::{
@@ -180,6 +181,39 @@ struct Config {
         help = "Sample-compatible prime for deterministic RWKV dataset scheduling"
     )]
     magic_prime: Option<u64>,
+
+    #[arg(
+        long = "parity_check",
+        help = "Compare LibTorch and WGPU intermediate tensors instead of interactive generation"
+    )]
+    parity_check: bool,
+
+    #[arg(
+        long = "parity_prompt",
+        default_value_t = String::from("Hello"),
+        help = "Prompt used for backend parity comparison"
+    )]
+    parity_prompt: String,
+
+    #[arg(
+        long = "parity_tolerance",
+        default_value_t = 1e-4_f32,
+        help = "Absolute tolerance used for backend parity reporting"
+    )]
+    parity_tolerance: f32,
+
+    #[arg(
+        long = "parity_max_tokens",
+        default_value_t = 32,
+        help = "Maximum number of prompt tokens to compare during parity checks (0 = all)"
+    )]
+    parity_max_tokens: usize,
+
+    #[arg(
+        long = "parity_verbose",
+        help = "Print per-tensor backend parity details"
+    )]
+    parity_verbose: bool,
 }
 
 impl Config {
@@ -228,6 +262,8 @@ fn main() -> Result<()> {
 
     if config.train {
         run_training(&config)
+    } else if config.parity_check {
+        parity::run(&config)
     } else {
         run_generate(&config)
     }
