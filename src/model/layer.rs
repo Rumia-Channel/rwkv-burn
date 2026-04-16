@@ -6,7 +6,7 @@ use burn::{
 
 use super::{
     channel_mix::ChannelMix,
-    time_mix::TimeMix,
+    time_mix::{FrontPathStrategy, TimeMix},
     trace::LayerTrace,
 };
 
@@ -251,5 +251,10 @@ impl<B: Backend> Layer<B> {
             },
             trace,
         )
+    }
+
+    pub fn set_front_path_strategy(&mut self, strategy: FrontPathStrategy) {
+        self.tmix.set_front_path_strategy(strategy);
+        self.cmix.set_front_path_strategy(strategy);
     }
 }

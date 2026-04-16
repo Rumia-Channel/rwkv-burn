@@ -1,12 +1,14 @@
 use burn::{
     config::Config,
+    module::Ignored,
     nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig},
     prelude::*,
-    tensor::Tensor,
+    tensor::{DType, Tensor},
 };
 
 use super::{
     layer::{Layer, LayerState},
+    time_mix::FrontPathStrategy,
     trace::StepTrace,
 };
 
@@ -102,6 +104,7 @@ pub struct RWKVv7<B: Backend> {
     pub layer_norm_out: LayerNorm<B>,
     /// Final linear projection to vocabulary size.
     pub unembed: Linear<B>,
+    front_path: Ignored<FrontPathStrategy>,
 }
 
 impl<B: Backend> RWKVv7<B> {
@@ -180,6 +183,7 @@ impl<B: Backend> RWKVv7<B> {
             layers,
             layer_norm_out,
             unembed,
+            front_path: Ignored(FrontPathStrategy::Direct),
         }
     }
 
@@ -258,7 +262,10 @@ impl<B: Backend> RWKVv7<B> {
             state[i] = layer_state;
         }
 
-        (self.unembed.forward(self.layer_norm_out.forward(x)), state)
+        (
+            self.final_linear(self.layer_norm_out.forward(x)),
+            state,
+        )
     }
 
     pub fn forward_rnn_traced(
@@ -299,7 +306,7 @@ impl<B: Backend> RWKVv7<B> {
         let x = self.layer_norm_out.forward(x);
         trace.push("model_layer_norm_out", &x);
 
-        let logits = self.unembed.forward(x);
+        let logits = self.final_linear(x);
         trace.push("model_logits", &logits);
 
         (logits, state, trace)
@@ -327,5 +334,52 @@ impl<B: Backend> RWKVv7<B> {
                 ),
             })
             .collect::<Vec<LayerState<B>>>()
+    }
+
+    pub fn set_front_path_strategy(&mut self, strategy: FrontPathStrategy) {
+        self.front_path = Ignored(strategy);
+        for layer in self.layers.iter_mut() {
+            layer.set_front_path_strategy(strategy);
+        }
+    }
+
+    fn final_linear(&self, input: Tensor<B, 1>) -> Tensor<B, 1> {
+        match self.front_path.0 {
+            FrontPathStrategy::Direct => self.unembed.forward(input),
+            FrontPathStrategy::HostLinear => self.linear_forward_host(&self.unembed, input),
+        }
+    }
+
+    fn linear_forward_host(&self, linear: &Linear<B>, input: Tensor<B, 1>) -> Tensor<B, 1> {
+        let device = input.device();
+        let input = input.to_data().convert_dtype(DType::F32).to_vec::<f32>().unwrap();
+        let weight = linear
+            .weight
+            .val()
+            .to_data()
+            .convert_dtype(DType::F32)
+            .to_vec::<f32>()
+            .unwrap();
+        let [d_input, d_output] = linear.weight.val().dims();
+
+        let mut output = if let Some(bias) = linear.bias.as_ref() {
+            bias.val()
+                .to_data()
+                .convert_dtype(DType::F32)
+                .to_vec::<f32>()
+                .unwrap()
+        } else {
+            vec![0.0; d_output]
+        };
+
+        for i in 0..d_input {
+            let input_value = input[i];
+            let row_offset = i * d_output;
+            for o in 0..d_output {
+                output[o] += input_value * weight[row_offset + o];
+            }
+        }
+
+        Tensor::<B, 1>::from_data(output.as_slice(), &device)
     }
 }

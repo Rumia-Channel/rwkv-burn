@@ -29,6 +29,22 @@ cargo run -- --weights RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth.safetensor
 
 Add `--parity_verbose` to print per-layer tensor diffs for `TimeMix` / WKV internals.
 
+To test whether early WGPU drift is mainly coming from the `TimeMix` front-end projections, add:
+
+```bash
+--stable_frontpath
+```
+
+This switches the sensitive sequential `TimeMix` / `ChannelMix` projections and final `unembed` projection to a host-side reference matvec.
+
+You can also try the experimental WGPU inference path directly:
+
+```bash
+cargo run -- --weights RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth.safetensors --inference_backend wgpu --stable_frontpath --inference_mode sequential
+```
+
+This is still slower than the default LibTorch path, but it is useful for validating WGPU-side numerical fixes.
+
 ---
 
 ## Help wanted

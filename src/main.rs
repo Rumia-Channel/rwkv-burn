@@ -23,7 +23,7 @@ use rwkv_tokenizer::WorldTokenizer;
 use crate::{
     data::DatasetFormat,
     generator::Generator,
-    model::{RWKVv7, RWKVv7Config},
+    model::{FrontPathStrategy, RWKVv7, RWKVv7Config},
     training::TrainingConfig,
 };
 
@@ -31,6 +31,12 @@ use crate::{
 enum DatasetFormatArg {
     Text,
     Binidx,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum InferenceBackendArg {
+    Libtorch,
+    Wgpu,
 }
 
 impl From<DatasetFormatArg> for DatasetFormat {
@@ -139,6 +145,14 @@ struct Config {
     )]
     inference_mode: String,
 
+    #[arg(
+        long = "inference_backend",
+        value_enum,
+        default_value_t = InferenceBackendArg::Libtorch,
+        help = "Inference backend: Libtorch or Wgpu"
+    )]
+    inference_backend: InferenceBackendArg,
+
     #[arg(long = "data_file", help = "Training corpus path")]
     data_file: Option<String>,
 
@@ -214,6 +228,12 @@ struct Config {
         help = "Print per-tensor backend parity details"
     )]
     parity_verbose: bool,
+
+    #[arg(
+        long = "stable_frontpath",
+        help = "Use a host-side reference matvec for TimeMix receptance/key/value during WGPU parity or future WGPU inference experiments"
+    )]
+    stable_frontpath: bool,
 }
 
 impl Config {
@@ -270,10 +290,18 @@ fn main() -> Result<()> {
 }
 
 fn run_generate(config: &Config) -> Result<()> {
-    type BackendImpl = LibTorch;
+    match config.inference_backend {
+        InferenceBackendArg::Libtorch => run_generate_with_backend::<LibTorch>(config),
+        InferenceBackendArg::Wgpu => run_generate_with_backend::<Wgpu>(config),
+    }
+}
 
+fn run_generate_with_backend<B: Backend>(config: &Config) -> Result<()> {
     let device = Default::default();
-    let model = load_or_init_model::<BackendImpl>(config, &device)?;
+    let mut model = load_or_init_model::<B>(config, &device)?;
+    if config.stable_frontpath {
+        model.set_front_path_strategy(FrontPathStrategy::HostLinear);
+    }
     let tokenizer =
         WorldTokenizer::new(Some(&config.vocab_path)).context("failed to load tokenizer")?;
 

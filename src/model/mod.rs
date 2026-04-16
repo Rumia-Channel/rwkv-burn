@@ -8,4 +8,5 @@ mod trace;
 
 pub use layer::LayerState;
 pub use rwkv_v7::{RWKVv7, RWKVv7Config};
+pub use time_mix::FrontPathStrategy;
 pub use trace::{StepTrace, TensorSnapshot};

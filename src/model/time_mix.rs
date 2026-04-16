@@ -2,13 +2,20 @@ use burn::{
     module::{Ignored, Param},
     nn::{GroupNorm, GroupNormConfig, Linear, LinearConfig},
     prelude::*,
-    tensor::{Tensor, activation},
+    tensor::{DType, Tensor, activation},
 };
 
 use super::{
     kernels::WkvKernel,
     trace::TensorSnapshot,
 };
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum FrontPathStrategy {
+    #[default]
+    Direct,
+    HostLinear,
+}
 
 /// A module implementing the TimeMix layer for sequential processing.
 ///
@@ -54,6 +61,7 @@ pub struct TimeMix<B: Backend> {
     pub r_k: Param<Tensor<B, 2>>,
 
     wkv_op: Ignored<WkvKernel>,
+    front_path: Ignored<FrontPathStrategy>,
 
     pub receptance: Linear<B>,
     pub key: Linear<B>,
@@ -169,6 +177,7 @@ impl<B: Backend> TimeMix<B> {
             .init(device);
 
         let wkv_op = Ignored(WkvKernel::new(n_heads, head_size));
+        let front_path = Ignored(FrontPathStrategy::Direct);
 
         TimeMix {
             layer_id,
@@ -201,6 +210,7 @@ impl<B: Backend> TimeMix<B> {
             k_a,
             r_k,
             wkv_op,
+            front_path,
             receptance,
             key,
             value,
@@ -349,10 +359,10 @@ impl<B: Backend> TimeMix<B> {
         let xa = x.clone() + xx.clone().mul(self.x_a.val().reshape([self.d_model]));
         let xg = x.clone() + xx.clone().mul(self.x_g.val().reshape([self.d_model]));
 
-        let r = self.receptance.forward(xr);
+        let r = self.front_linear(&self.receptance, xr);
         let w = self.w2.forward(activation::tanh(self.w1.forward(xw)));
-        let k = self.key.forward(xk);
-        let mut v = self.value.forward(xv.clone());
+        let k = self.front_linear(&self.key, xk);
+        let mut v = self.front_linear(&self.value, xv.clone());
         let a = activation::sigmoid(
             self.a0.val().reshape([self.d_model]) + self.a2.forward(self.a1.forward(xa)),
         );
@@ -411,7 +421,7 @@ impl<B: Backend> TimeMix<B> {
                 .mul(v.reshape([self.n_heads, self.head_size]))
                 .reshape([self.d_model]);
 
-        let out = self.output.forward(out.mul(g));
+        let out = self.front_linear(&self.output, out.mul(g));
 
         (out, x, vk_state, v_first)
     }
@@ -454,10 +464,10 @@ impl<B: Backend> TimeMix<B> {
         trace.push(TensorSnapshot::from_tensor("tmix_xa", &xa));
         trace.push(TensorSnapshot::from_tensor("tmix_xg", &xg));
 
-        let r = self.receptance.forward(xr);
+        let r = self.front_linear(&self.receptance, xr);
         let w_delta = self.w2.forward(activation::tanh(self.w1.forward(xw)));
-        let k_raw = self.key.forward(xk);
-        let mut v = self.value.forward(xv.clone());
+        let k_raw = self.front_linear(&self.key, xk);
+        let mut v = self.front_linear(&self.value, xv.clone());
         let a = activation::sigmoid(
             self.a0.val().reshape([self.d_model]) + self.a2.forward(self.a1.forward(xa)),
         );
@@ -538,10 +548,54 @@ impl<B: Backend> TimeMix<B> {
                 .mul(v.reshape([self.n_heads, self.head_size]))
                 .reshape([self.d_model]);
 
-        let out = self.output.forward(out.mul(g));
+        let out = self.front_linear(&self.output, out.mul(g));
         trace.push(TensorSnapshot::from_tensor("tmix_output", &out));
 
         (out, x, vk_state, v_first, trace)
+    }
+
+    pub fn set_front_path_strategy(&mut self, strategy: FrontPathStrategy) {
+        self.front_path = Ignored(strategy);
+    }
+
+    fn front_linear(&self, linear: &Linear<B>, input: Tensor<B, 1>) -> Tensor<B, 1> {
+        match self.front_path.0 {
+            FrontPathStrategy::Direct => linear.forward(input),
+            FrontPathStrategy::HostLinear => self.linear_forward_host(linear, input),
+        }
+    }
+
+    fn linear_forward_host(&self, linear: &Linear<B>, input: Tensor<B, 1>) -> Tensor<B, 1> {
+        let device = input.device();
+        let input = input.to_data().convert_dtype(DType::F32).to_vec::<f32>().unwrap();
+        let weight = linear
+            .weight
+            .val()
+            .to_data()
+            .convert_dtype(DType::F32)
+            .to_vec::<f32>()
+            .unwrap();
+        let [d_input, d_output] = linear.weight.val().dims();
+
+        let mut output = if let Some(bias) = linear.bias.as_ref() {
+            bias.val()
+                .to_data()
+                .convert_dtype(DType::F32)
+                .to_vec::<f32>()
+                .unwrap()
+        } else {
+            vec![0.0; d_output]
+        };
+
+        for i in 0..d_input {
+            let input_value = input[i];
+            let row_offset = i * d_output;
+            for o in 0..d_output {
+                output[o] += input_value * weight[row_offset + o];
+            }
+        }
+
+        Tensor::<B, 1>::from_data(output.as_slice(), &device)
     }
 }
 

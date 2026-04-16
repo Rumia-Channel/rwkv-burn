@@ -1,9 +1,11 @@
 use burn::{
-    module::Param,
+    module::{Ignored, Param},
     nn::{Linear, LinearConfig},
     prelude::*,
-    tensor::{Tensor, activation},
+    tensor::{DType, Tensor, activation},
 };
+
+use super::time_mix::FrontPathStrategy;
 
 /// A feedforward (channel mixing) layer used in RWKV models.
 ///
@@ -25,6 +27,7 @@ pub struct ChannelMix<B: Backend> {
     pub key: Linear<B>,
     /// Linear layer for projecting back to the original model dimension.
     pub value: Linear<B>,
+    front_path: Ignored<FrontPathStrategy>,
 }
 
 impl<B: Backend> ChannelMix<B> {
@@ -45,6 +48,7 @@ impl<B: Backend> ChannelMix<B> {
         let value = LinearConfig::new(dim_ffn, d_model)
             .with_bias(false)
             .init::<B>(device);
+        let front_path = Ignored(FrontPathStrategy::Direct);
 
         ChannelMix {
             d_model,
@@ -52,6 +56,7 @@ impl<B: Backend> ChannelMix<B> {
             x_k,
             key,
             value,
+            front_path,
         }
     }
 
@@ -100,9 +105,53 @@ impl<B: Backend> ChannelMix<B> {
     ) -> (Tensor<B, 1>, Tensor<B, 1>) {
         let xx = x_prev - x.clone();
         let k = x.clone() + xx.mul(self.x_k.val().reshape([self.d_model]));
-        let k = activation::relu(self.key.forward(k)).powf_scalar(2.0);
+        let k = activation::relu(self.front_linear(&self.key, k)).powf_scalar(2.0);
 
-        (self.value.forward(k), x)
+        (self.front_linear(&self.value, k), x)
+    }
+
+    pub fn set_front_path_strategy(&mut self, strategy: FrontPathStrategy) {
+        self.front_path = Ignored(strategy);
+    }
+
+    fn front_linear(&self, linear: &Linear<B>, input: Tensor<B, 1>) -> Tensor<B, 1> {
+        match self.front_path.0 {
+            FrontPathStrategy::Direct => linear.forward(input),
+            FrontPathStrategy::HostLinear => self.linear_forward_host(linear, input),
+        }
+    }
+
+    fn linear_forward_host(&self, linear: &Linear<B>, input: Tensor<B, 1>) -> Tensor<B, 1> {
+        let device = input.device();
+        let input = input.to_data().convert_dtype(DType::F32).to_vec::<f32>().unwrap();
+        let weight = linear
+            .weight
+            .val()
+            .to_data()
+            .convert_dtype(DType::F32)
+            .to_vec::<f32>()
+            .unwrap();
+        let [d_input, d_output] = linear.weight.val().dims();
+
+        let mut output = if let Some(bias) = linear.bias.as_ref() {
+            bias.val()
+                .to_data()
+                .convert_dtype(DType::F32)
+                .to_vec::<f32>()
+                .unwrap()
+        } else {
+            vec![0.0; d_output]
+        };
+
+        for i in 0..d_input {
+            let input_value = input[i];
+            let row_offset = i * d_output;
+            for o in 0..d_output {
+                output[o] += input_value * weight[row_offset + o];
+            }
+        }
+
+        Tensor::<B, 1>::from_data(output.as_slice(), &device)
     }
 }
 

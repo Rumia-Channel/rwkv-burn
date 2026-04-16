@@ -5,7 +5,7 @@ use rwkv_tokenizer::WorldTokenizer;
 use crate::{
     Config,
     load_or_init_model,
-    model::{StepTrace, TensorSnapshot},
+    model::{FrontPathStrategy, StepTrace, TensorSnapshot},
 };
 
 struct TensorDiff {
@@ -26,6 +26,9 @@ pub fn run(config: &Config) -> Result<()> {
 
     let mut stable_model = load_or_init_model::<StableBackend>(config, &stable_device)?;
     let mut candidate_model = load_or_init_model::<CandidateBackend>(config, &candidate_device)?;
+    if config.stable_frontpath {
+        candidate_model.set_front_path_strategy(FrontPathStrategy::HostLinear);
+    }
     let tokenizer = WorldTokenizer::new(Some(&config.vocab_path))?;
 
     let prompt = format!("User: {}\n\nAssistant:", config.parity_prompt.trim());
