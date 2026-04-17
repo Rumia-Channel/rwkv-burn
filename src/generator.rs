@@ -14,9 +14,9 @@ const TURN_STOP_MARKERS: [&str; 3] = ["\n\nUser:", "\nUser:", "User:"];
 /// Defines the inference mode for text generation.
 #[derive(Debug, Clone, Copy)]
 pub enum InferenceMode {
-    Parallel, 
+    Parallel,
     Sequential,
-    Mixed // Default
+    Mixed, // Default
 }
 
 /// A text generator based on the RWKVv7 model, using a tokenizer and
@@ -33,6 +33,7 @@ pub struct Generator<'a, B: Backend> {
     top_p: f32,
     temperature: f32,
     rng: rand::rngs::ThreadRng,
+    recurrent_state: Option<Vec<LayerState<B>>>,
 }
 
 impl<'a, B: Backend> Generator<'a, B> {
@@ -45,7 +46,13 @@ impl<'a, B: Backend> Generator<'a, B> {
     ///
     /// # Returns
     /// A `Generator` instance ready for text generation.
-    pub fn new(model: RWKVv7<B>, tokenizer: &'a WorldTokenizer, temperature: f32, top_p: f32,  top_k: usize) -> Self {
+    pub fn new(
+        model: RWKVv7<B>,
+        tokenizer: &'a WorldTokenizer,
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+    ) -> Self {
         Self {
             model,
             inference_mode: InferenceMode::Mixed,
@@ -54,6 +61,7 @@ impl<'a, B: Backend> Generator<'a, B> {
             top_p,
             temperature,
             rng: rand::rng(),
+            recurrent_state: None,
         }
     }
 
@@ -63,6 +71,13 @@ impl<'a, B: Backend> Generator<'a, B> {
     /// * `inference_mode` - Desired inference mode.
     pub fn set_inference_mode(&mut self, inference_mode: InferenceMode) {
         self.inference_mode = inference_mode;
+        if !matches!(inference_mode, InferenceMode::Sequential) {
+            self.recurrent_state = None;
+        }
+    }
+
+    pub fn reset_sequence_state(&mut self) {
+        self.recurrent_state = None;
     }
 
     pub fn generate_from_prompt(&mut self, prompt: &str, max_new_tokens: usize) -> String {
@@ -82,6 +97,20 @@ impl<'a, B: Backend> Generator<'a, B> {
                 }
             }
         }
+    }
+
+    pub fn generate_from_suffix(&mut self, prompt_suffix: &str, max_new_tokens: usize) -> String {
+        if !matches!(self.inference_mode, InferenceMode::Sequential) {
+            return self.generate_from_prompt(prompt_suffix, max_new_tokens);
+        }
+
+        let state = self
+            .recurrent_state
+            .take()
+            .unwrap_or_else(|| self.model.get_init_state());
+        let (generated, state) = self.generate_sequential(prompt_suffix, max_new_tokens, state);
+        self.recurrent_state = Some(state);
+        generated
     }
 
     /// Converts a prompt string into a tensor suitable for model input.
@@ -135,40 +164,35 @@ impl<'a, B: Backend> Generator<'a, B> {
         max_new_tokens: usize,
         state: Vec<LayerState<B>>,
     ) -> (String, Vec<LayerState<B>>) {
-        let x = self.prompt_to_vec(prompt);
-
         let mut state = state;
-        let mut y: Tensor<B, 1>;
-
-        let mut last_token: i32 = 0;
-
         let mut out = String::new();
+        let mut next_logits = None;
 
-        for token in x {
-            (y, state) = self.model.forward_rnn(token, state);
-
-            if let (Ok(string), token, _) = self.sample_next_token(y) {
-                out.clear();
-                if append_and_check_stop(&mut out, &string) {
-                    return (out, state);
-                }
-                last_token = token as i32;
-            }
+        for token in self.prompt_to_vec(prompt) {
+            let (logits, next_state) = self.model.forward_rnn(token, state);
+            state = next_state;
+            next_logits = Some(logits);
         }
 
-        for _ in 0..max_new_tokens {
-            (y, state) = self.model.forward_rnn(last_token, state);
+        let Some(mut y) = next_logits else {
+            return (out, state);
+        };
 
+        for _ in 0..max_new_tokens {
             if let (Ok(string), token, _) = self.sample_next_token(y) {
                 if append_and_check_stop(&mut out, &string) {
                     break;
                 }
-                last_token = token as i32;
 
-                // stop at EndOfText token
                 if token == 0 {
                     break;
                 }
+
+                let (next_y, next_state) = self.model.forward_rnn(token as i32, state);
+                state = next_state;
+                y = next_y;
+            } else {
+                break;
             }
         }
 
@@ -189,10 +213,10 @@ impl<'a, B: Backend> Generator<'a, B> {
         prompt: &str,
         max_new_tokens: usize,
     ) -> (String, Vec<LayerState<B>>) {
-
         let mut prompt_with_first_token = prompt.to_string();
         let mut generated = String::new();
-        let mut state: Vec<LayerState<B>> = Vec::<LayerState<B>>::with_capacity(self.model.layers.len());
+        let mut state: Vec<LayerState<B>> =
+            Vec::<LayerState<B>>::with_capacity(self.model.layers.len());
 
         for _ in 0..max_new_tokens {
             let x = self.prompt_to_tensor(&prompt_with_first_token);
@@ -258,7 +282,7 @@ impl<'a, B: Backend> Generator<'a, B> {
                 })
                 .take_while(|&cumsum| cumsum <= self.top_p)
                 .count();
-            
+
             if boundary > 0 {
                 tokens = tokens[0..boundary].to_vec();
                 probs = probs[0..boundary].to_vec();
@@ -269,29 +293,18 @@ impl<'a, B: Backend> Generator<'a, B> {
         }
 
         // multinomial sampling
-        let items: Vec<(u16, f32)> = tokens.into_iter()
-            .zip(probs.into_iter())
-            .collect();
+        let items: Vec<(u16, f32)> = tokens.into_iter().zip(probs.into_iter()).collect();
 
-        let choice = items
-            .choose_weighted(&mut self.rng, |item| item.1);
+        let choice = items.choose_weighted(&mut self.rng, |item| item.1);
 
         if let Ok((token, prob)) = choice {
-            (
-                self.tokenizer.decode(vec![*token]), 
-                *token, 
-                *prob
-            )
+            (self.tokenizer.decode(vec![*token]), *token, *prob)
         } else {
             // Fallback in case of sampling failure
             let token = items[0].0;
             let prob = items[0].1;
-            
-            (
-                self.tokenizer.decode(vec![token]),
-                token,
-                prob,
-            )
+
+            (self.tokenizer.decode(vec![token]), token, prob)
         }
     }
 }

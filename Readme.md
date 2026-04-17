@@ -43,7 +43,7 @@ You can also try the experimental WGPU inference path directly:
 cargo run -- --weights RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth.safetensors --inference_backend wgpu
 ```
 
-WGPU inference now **auto-enables the stable frontpath mitigation and forces sequential mode**, because mixed / parallel prefill is still numerically unstable on this backend. It is still slower than the default LibTorch path, but it is useful for validating WGPU-side numerical fixes.
+WGPU inference now **auto-enables the stable frontpath mitigation and forces sequential mode**, because mixed / parallel prefill is still numerically unstable on this backend. It is still slower than the default LibTorch path, but interactive sequential inference now keeps recurrent state across turns instead of replaying the full transcript every time, which reduces chat latency growth.
 
 ---
 
@@ -91,6 +91,8 @@ cargo run --release -- \
   --weights /path/to/model_weights.pth.safetensors \
   --top_p 0.6 \
   --temperature 0.8
+
+# In interactive mode, `\reset` now clears both the visible transcript and the cached recurrent state.
 ```
 
 ### Continue inference from a trained Burn checkpoint

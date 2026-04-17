@@ -98,7 +98,11 @@ struct Config {
     )]
     vocab_path: String,
 
-    #[arg(short = 'w', long = "weights", help = "Path to safetensors weight file")]
+    #[arg(
+        short = 'w',
+        long = "weights",
+        help = "Path to safetensors weight file"
+    )]
     weights: Option<String>,
 
     #[arg(
@@ -164,13 +168,21 @@ struct Config {
     )]
     dataset_format: DatasetFormatArg,
 
-    #[arg(long = "ctx_len", default_value_t = 256, help = "Training context length")]
+    #[arg(
+        long = "ctx_len",
+        default_value_t = 256,
+        help = "Training context length"
+    )]
     ctx_len: usize,
 
     #[arg(long = "batch_size", default_value_t = 4, help = "Training batch size")]
     batch_size: usize,
 
-    #[arg(long = "train_steps", default_value_t = 1000, help = "Number of training steps")]
+    #[arg(
+        long = "train_steps",
+        default_value_t = 1000,
+        help = "Number of training steps"
+    )]
     train_steps: usize,
 
     #[arg(
@@ -359,27 +371,40 @@ fn run_generate_with_backend<B: Backend>(config: &Config) -> Result<()> {
 
                 if trimmed_input.eq_ignore_ascii_case("\\reset") {
                     transcript.clear();
+                    generator.reset_sequence_state();
                     println!("Resetting conversation transcript.");
                     continue;
                 }
 
-                let prompt = if transcript.is_empty() {
+                let prompt_suffix = if transcript.is_empty() {
                     format!("User: {}\n\nAssistant:", trimmed_input)
                 } else {
-                    format!("{}\n\nUser: {}\n\nAssistant:", transcript, trimmed_input)
+                    format!("\n\nUser: {}\n\nAssistant:", trimmed_input)
                 };
 
                 print!("Assistant: ");
                 let _ = io::stdout().flush();
 
-                let completion = generator.generate_from_prompt(&prompt, config.max_new_tokens);
+                let completion = if matches!(effective_mode, InferenceMode::Sequential) {
+                    generator.generate_from_suffix(&prompt_suffix, config.max_new_tokens)
+                } else {
+                    let prompt = if transcript.is_empty() {
+                        prompt_suffix.clone()
+                    } else {
+                        format!("{}{}", transcript, prompt_suffix)
+                    };
+                    generator.generate_from_prompt(&prompt, config.max_new_tokens)
+                };
                 print!("{}", completion);
                 let _ = io::stdout().flush();
 
                 transcript = if transcript.is_empty() {
                     format!("User: {}\n\nAssistant:{}", trimmed_input, completion)
                 } else {
-                    format!("{}\n\nUser: {}\n\nAssistant:{}", transcript, trimmed_input, completion)
+                    format!(
+                        "{}\n\nUser: {}\n\nAssistant:{}",
+                        transcript, trimmed_input, completion
+                    )
                 };
             }
             Err(err) => println!("Could not read input: {err}"),
