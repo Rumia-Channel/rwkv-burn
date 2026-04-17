@@ -40,10 +40,10 @@ This switches the sensitive sequential `TimeMix` / `ChannelMix` projections and 
 You can also try the experimental WGPU inference path directly:
 
 ```bash
-cargo run -- --weights RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth.safetensors --inference_backend wgpu --stable_frontpath --inference_mode sequential
+cargo run -- --weights RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth.safetensors --inference_backend wgpu
 ```
 
-This is still slower than the default LibTorch path, but it is useful for validating WGPU-side numerical fixes.
+WGPU inference now **auto-enables the stable frontpath mitigation and forces sequential mode**, because mixed / parallel prefill is still numerically unstable on this backend. It is still slower than the default LibTorch path, but it is useful for validating WGPU-side numerical fixes.
 
 ---
 

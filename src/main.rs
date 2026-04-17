@@ -231,7 +231,7 @@ struct Config {
 
     #[arg(
         long = "stable_frontpath",
-        help = "Use a host-side reference matvec for TimeMix receptance/key/value during WGPU parity or future WGPU inference experiments"
+        help = "Use a host-side reference matvec for sensitive sequential WGPU projections; auto-enabled for WGPU inference"
     )]
     stable_frontpath: bool,
 }
@@ -299,7 +299,9 @@ fn run_generate(config: &Config) -> Result<()> {
 fn run_generate_with_backend<B: Backend>(config: &Config) -> Result<()> {
     let device = Default::default();
     let mut model = load_or_init_model::<B>(config, &device)?;
-    if config.stable_frontpath {
+    let wgpu_inference = matches!(config.inference_backend, InferenceBackendArg::Wgpu);
+    let stable_frontpath = config.stable_frontpath || wgpu_inference;
+    if stable_frontpath {
         model.set_front_path_strategy(FrontPathStrategy::HostLinear);
     }
     let tokenizer =
@@ -313,18 +315,33 @@ fn run_generate_with_backend<B: Backend>(config: &Config) -> Result<()> {
         config.top_k,
     );
 
-    match config.inference_mode.to_lowercase().as_str() {
-        "mixed" => generator.set_inference_mode(InferenceMode::Mixed),
-        "parallel" => generator.set_inference_mode(InferenceMode::Parallel),
-        "sequential" => generator.set_inference_mode(InferenceMode::Sequential),
+    let requested_mode = match config.inference_mode.to_lowercase().as_str() {
+        "mixed" => InferenceMode::Mixed,
+        "parallel" => InferenceMode::Parallel,
+        "sequential" => InferenceMode::Sequential,
         _ => {
             println!(
                 "Inference mode '{}' not implemented. Falling back to 'Mixed'.",
                 config.inference_mode
             );
-            generator.set_inference_mode(InferenceMode::Mixed);
+            InferenceMode::Mixed
         }
     };
+
+    let effective_mode = if wgpu_inference {
+        if !matches!(requested_mode, InferenceMode::Sequential) {
+            println!(
+                "WGPU inference currently forces 'Sequential' mode to avoid unstable parallel prefill."
+            );
+        }
+        if !config.stable_frontpath {
+            println!("WGPU inference auto-enables the stable frontpath mitigation.");
+        }
+        InferenceMode::Sequential
+    } else {
+        requested_mode
+    };
+    generator.set_inference_mode(effective_mode);
 
     let mut state = None;
     loop {
