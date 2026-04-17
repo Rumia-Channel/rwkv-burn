@@ -2,20 +2,15 @@ use burn::{
     module::{Ignored, Param},
     nn::{GroupNorm, GroupNormConfig, Linear, LinearConfig},
     prelude::*,
-    tensor::{DType, Tensor, activation},
+    tensor::{Tensor, activation},
 };
 
 use super::{
+    frontpath::{front_linear, front_linear_3d},
     kernels::WkvKernel,
     trace::TensorSnapshot,
 };
-
-#[derive(Clone, Copy, Debug, Default)]
-pub enum FrontPathStrategy {
-    #[default]
-    Direct,
-    HostLinear,
-}
+use crate::model::FrontPathStrategy;
 
 /// A module implementing the TimeMix layer for sequential processing.
 ///
@@ -102,25 +97,38 @@ impl<B: Backend> TimeMix<B> {
         let ratio_0_to_1 = layer_id as f32 / n_layer.saturating_sub(1).max(1) as f32;
         let ratio_1_to_almost0 = 1.0 - (layer_id as f32 / n_layer.max(1) as f32);
 
-        let x_r =
-            Param::from_tensor(init_mix_vector::<B>(device, d_model, 0.2 * ratio_1_to_almost0));
-        let x_w =
-            Param::from_tensor(init_mix_vector::<B>(device, d_model, 0.9 * ratio_1_to_almost0));
-        let x_k =
-            Param::from_tensor(init_mix_vector::<B>(device, d_model, 0.7 * ratio_1_to_almost0));
-        let x_v =
-            Param::from_tensor(init_mix_vector::<B>(device, d_model, 0.7 * ratio_1_to_almost0));
-        let x_a =
-            Param::from_tensor(init_mix_vector::<B>(device, d_model, 0.9 * ratio_1_to_almost0));
-        let x_g =
-            Param::from_tensor(init_mix_vector::<B>(device, d_model, 0.2 * ratio_1_to_almost0));
-
-        let w0 = Param::from_tensor(init_w0::<B>(
+        let x_r = Param::from_tensor(init_mix_vector::<B>(
             device,
             d_model,
-            head_size,
-            ratio_0_to_1,
+            0.2 * ratio_1_to_almost0,
         ));
+        let x_w = Param::from_tensor(init_mix_vector::<B>(
+            device,
+            d_model,
+            0.9 * ratio_1_to_almost0,
+        ));
+        let x_k = Param::from_tensor(init_mix_vector::<B>(
+            device,
+            d_model,
+            0.7 * ratio_1_to_almost0,
+        ));
+        let x_v = Param::from_tensor(init_mix_vector::<B>(
+            device,
+            d_model,
+            0.7 * ratio_1_to_almost0,
+        ));
+        let x_a = Param::from_tensor(init_mix_vector::<B>(
+            device,
+            d_model,
+            0.9 * ratio_1_to_almost0,
+        ));
+        let x_g = Param::from_tensor(init_mix_vector::<B>(
+            device,
+            d_model,
+            0.2 * ratio_1_to_almost0,
+        ));
+
+        let w0 = Param::from_tensor(init_w0::<B>(device, d_model, head_size, ratio_0_to_1));
         let w1 = LinearConfig::new(d_model, d_decay_lora)
             .with_bias(false)
             .init::<B>(device);
@@ -253,13 +261,13 @@ impl<B: Backend> TimeMix<B> {
         let xa = x.clone() + xx.clone().mul(self.x_a.val());
         let xg = x.clone() + xx.clone().mul(self.x_g.val());
 
-        let r = self.receptance.forward(xr);
+        let r = self.front_linear_parallel(&self.receptance, xr);
         let w = -activation::softplus(
             -(self.w0.val() + self.w2.forward(activation::tanh(self.w1.forward(xw)))),
             1.0,
         ) - 0.5;
 
-        let mut v = self.value.forward(xv.clone());
+        let mut v = self.front_linear_parallel(&self.value, xv.clone());
 
         if let Some(_v_first) = v_first.clone() {
             v = v.clone()
@@ -273,7 +281,7 @@ impl<B: Backend> TimeMix<B> {
         let a = activation::sigmoid(self.a0.val() + self.a2.forward(self.a1.forward(xa)));
         let g = self.g2.forward(activation::sigmoid(self.g1.forward(xg)));
 
-        let k = self.key.forward(xk);
+        let k = self.front_linear_parallel(&self.key, xk);
         let kk = k.clone().mul(self.k_k.val());
         let kk = kk.reshape([batch_size, time_steps, self.n_heads, self.head_size]);
         let kk_norm = kk
@@ -283,15 +291,22 @@ impl<B: Backend> TimeMix<B> {
             .add_scalar(1e-12)
             .sqrt()
             .reshape([batch_size, time_steps, self.n_heads, 1]);
-        let kk = kk.clone().div(kk_norm).reshape([batch_size, time_steps, self.d_model]);
+        let kk = kk
+            .clone()
+            .div(kk_norm)
+            .reshape([batch_size, time_steps, self.d_model]);
         let k = k
             .clone()
             .mul((a.clone() - 1).mul(self.k_a.val()).add_scalar(1.0));
 
-        let (x, state): (Tensor<B, 3>, Tensor<B, 4>) =
-            self.wkv_op
-                .clone()
-                .forward_parallel(r.clone(), w, k.clone(), v.clone(), -kk.clone(), kk.mul(a));
+        let (x, state): (Tensor<B, 3>, Tensor<B, 4>) = self.wkv_op.clone().forward_parallel(
+            r.clone(),
+            w,
+            k.clone(),
+            v.clone(),
+            -kk.clone(),
+            kk.mul(a),
+        );
 
         let x = self
             .group_norm
@@ -313,7 +328,7 @@ impl<B: Backend> TimeMix<B> {
                 self.head_size,
             ])))
             .reshape([batch_size, time_steps, self.d_model]);
-        let x = self.output.forward(x.mul(g));
+        let x = self.front_linear_parallel(&self.output, x.mul(g));
 
         (x, v_first, state)
     }
@@ -559,43 +574,11 @@ impl<B: Backend> TimeMix<B> {
     }
 
     fn front_linear(&self, linear: &Linear<B>, input: Tensor<B, 1>) -> Tensor<B, 1> {
-        match self.front_path.0 {
-            FrontPathStrategy::Direct => linear.forward(input),
-            FrontPathStrategy::HostLinear => self.linear_forward_host(linear, input),
-        }
+        front_linear(self.front_path.0, linear, input)
     }
 
-    fn linear_forward_host(&self, linear: &Linear<B>, input: Tensor<B, 1>) -> Tensor<B, 1> {
-        let device = input.device();
-        let input = input.to_data().convert_dtype(DType::F32).to_vec::<f32>().unwrap();
-        let weight = linear
-            .weight
-            .val()
-            .to_data()
-            .convert_dtype(DType::F32)
-            .to_vec::<f32>()
-            .unwrap();
-        let [d_input, d_output] = linear.weight.val().dims();
-
-        let mut output = if let Some(bias) = linear.bias.as_ref() {
-            bias.val()
-                .to_data()
-                .convert_dtype(DType::F32)
-                .to_vec::<f32>()
-                .unwrap()
-        } else {
-            vec![0.0; d_output]
-        };
-
-        for i in 0..d_input {
-            let input_value = input[i];
-            let row_offset = i * d_output;
-            for o in 0..d_output {
-                output[o] += input_value * weight[row_offset + o];
-            }
-        }
-
-        Tensor::<B, 1>::from_data(output.as_slice(), &device)
+    fn front_linear_parallel(&self, linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
+        front_linear_3d(self.front_path.0, linear, input)
     }
 }
 

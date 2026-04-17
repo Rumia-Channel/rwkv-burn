@@ -243,7 +243,7 @@ struct Config {
 
     #[arg(
         long = "stable_frontpath",
-        help = "Use a host-side reference matvec for sensitive sequential WGPU projections; auto-enabled for WGPU inference"
+        help = "Use the numerically safer frontpath for sensitive sequential WGPU projections; auto-enabled for WGPU inference"
     )]
     stable_frontpath: bool,
 }
@@ -314,7 +314,7 @@ fn run_generate_with_backend<B: Backend>(config: &Config) -> Result<()> {
     let wgpu_inference = matches!(config.inference_backend, InferenceBackendArg::Wgpu);
     let stable_frontpath = config.stable_frontpath || wgpu_inference;
     if stable_frontpath {
-        model.set_front_path_strategy(FrontPathStrategy::HostLinear);
+        model.set_front_path_strategy(FrontPathStrategy::GpuChunkedLinear);
     }
     let tokenizer =
         WorldTokenizer::new(Some(&config.vocab_path)).context("failed to load tokenizer")?;

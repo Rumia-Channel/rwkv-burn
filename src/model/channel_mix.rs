@@ -2,10 +2,11 @@ use burn::{
     module::{Ignored, Param},
     nn::{Linear, LinearConfig},
     prelude::*,
-    tensor::{DType, Tensor, activation},
+    tensor::{Tensor, activation},
 };
 
-use super::time_mix::FrontPathStrategy;
+use super::frontpath::{front_linear, front_linear_3d};
+use crate::model::FrontPathStrategy;
 
 /// A feedforward (channel mixing) layer used in RWKV models.
 ///
@@ -80,10 +81,12 @@ impl<B: Backend> ChannelMix<B> {
             .pad((0, 0, 1, 0), 0);
         let xx = xx - x.clone();
 
-        let k = activation::relu(self.key.forward(x.clone() + xx.mul(self.x_k.val())));
+        let k = activation::relu(
+            self.front_linear_parallel(&self.key, x.clone() + xx.mul(self.x_k.val())),
+        );
         let k = k.clone().mul(k);
 
-        self.value.forward(k)
+        self.front_linear_parallel(&self.value, k)
     }
 
     /// Forward pass in recurrent mode, used for step-by-step inference.
@@ -115,43 +118,11 @@ impl<B: Backend> ChannelMix<B> {
     }
 
     fn front_linear(&self, linear: &Linear<B>, input: Tensor<B, 1>) -> Tensor<B, 1> {
-        match self.front_path.0 {
-            FrontPathStrategy::Direct => linear.forward(input),
-            FrontPathStrategy::HostLinear => self.linear_forward_host(linear, input),
-        }
+        front_linear(self.front_path.0, linear, input)
     }
 
-    fn linear_forward_host(&self, linear: &Linear<B>, input: Tensor<B, 1>) -> Tensor<B, 1> {
-        let device = input.device();
-        let input = input.to_data().convert_dtype(DType::F32).to_vec::<f32>().unwrap();
-        let weight = linear
-            .weight
-            .val()
-            .to_data()
-            .convert_dtype(DType::F32)
-            .to_vec::<f32>()
-            .unwrap();
-        let [d_input, d_output] = linear.weight.val().dims();
-
-        let mut output = if let Some(bias) = linear.bias.as_ref() {
-            bias.val()
-                .to_data()
-                .convert_dtype(DType::F32)
-                .to_vec::<f32>()
-                .unwrap()
-        } else {
-            vec![0.0; d_output]
-        };
-
-        for i in 0..d_input {
-            let input_value = input[i];
-            let row_offset = i * d_output;
-            for o in 0..d_output {
-                output[o] += input_value * weight[row_offset + o];
-            }
-        }
-
-        Tensor::<B, 1>::from_data(output.as_slice(), &device)
+    fn front_linear_parallel(&self, linear: &Linear<B>, input: Tensor<B, 3>) -> Tensor<B, 3> {
+        front_linear_3d(self.front_path.0, linear, input)
     }
 }
 

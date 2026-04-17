@@ -4,11 +4,8 @@ use burn::{
     tensor::Tensor,
 };
 
-use super::{
-    channel_mix::ChannelMix,
-    time_mix::{FrontPathStrategy, TimeMix},
-    trace::LayerTrace,
-};
+use super::{channel_mix::ChannelMix, time_mix::TimeMix, trace::LayerTrace};
+use crate::model::FrontPathStrategy;
 
 /// Stores the internal recurrent state for a transformer layer.
 ///
@@ -148,9 +145,9 @@ impl<B: Backend> Layer<B> {
     ) -> (Tensor<B, 3>, Option<Tensor<B, 3>>, LayerState<B>) {
         let _x = self.layer_norm_1.forward(x.clone());
 
-        let tmix_prev = _x.clone();        
+        let tmix_prev = _x.clone();
         let (x_tmix, v_first, tmix_kv) = self.tmix.forward_parallel(_x, v_first);
-        
+
         let _x = x + x_tmix;
         let x_normed = self.layer_norm_2.forward(_x.clone());
         let cmix_prev = x_normed.clone();
@@ -158,10 +155,10 @@ impl<B: Backend> Layer<B> {
         let x = _x.clone() + self.cmix.forward_parallel(x_normed);
         let dims_x = x.dims();
 
-        let layer_state = LayerState::<B>{
-            tmix_x_prev: tmix_prev.slice([dims_x[0]-1, dims_x[1]-1]),
+        let layer_state = LayerState::<B> {
+            tmix_x_prev: tmix_prev.slice([dims_x[0] - 1, dims_x[1] - 1]),
             tmix_kv: tmix_kv.reshape([self.n_heads, self.head_size, self.head_size]),
-            cmix_x_prev: cmix_prev.slice([dims_x[0]-1, dims_x[1]-1])
+            cmix_x_prev: cmix_prev.slice([dims_x[0] - 1, dims_x[1] - 1]),
         };
 
         (x, v_first, layer_state)
@@ -220,7 +217,12 @@ impl<B: Backend> Layer<B> {
         tmix_x_prev: Tensor<B, 1>,
         tmix_vk_state: Tensor<B, 3>,
         cmix_x_prev: Tensor<B, 1>,
-    ) -> (Tensor<B, 1>, Option<Tensor<B, 1>>, LayerState<B>, LayerTrace) {
+    ) -> (
+        Tensor<B, 1>,
+        Option<Tensor<B, 1>>,
+        LayerState<B>,
+        LayerTrace,
+    ) {
         let mut trace = LayerTrace::new(self.layer_id);
 
         let x_normed = self.layer_norm_1.forward(x.clone());

@@ -35,7 +35,7 @@ To test whether early WGPU drift is mainly coming from the `TimeMix` front-end p
 --stable_frontpath
 ```
 
-This switches the sensitive sequential `TimeMix` / `ChannelMix` projections and final `unembed` projection to a host-side reference matvec.
+This switches the sensitive frontpath projections to the safer GPU-resident chunked FP32 path used for `TimeMix`, `ChannelMix`, and the final `unembed`.
 
 You can also try the experimental WGPU inference path directly:
 
@@ -43,7 +43,7 @@ You can also try the experimental WGPU inference path directly:
 cargo run -- --weights RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth.safetensors --inference_backend wgpu
 ```
 
-WGPU inference now **auto-enables the stable frontpath mitigation and forces sequential mode**, because mixed / parallel prefill is still numerically unstable on this backend. It is still slower than the default LibTorch path, but interactive sequential inference now keeps recurrent state across turns instead of replaying the full transcript every time, which reduces chat latency growth.
+WGPU inference now **auto-enables the stable frontpath mitigation and forces sequential mode**, because mixed / parallel prefill is still numerically unstable on this backend. The mitigation now uses a **GPU-resident chunked FP32 frontpath** for the sensitive `TimeMix` / `ChannelMix` / `unembed` projections instead of copying tensors to the host, so it preserves the current parity behavior while removing the biggest CPU-transfer bottleneck. Interactive sequential inference also keeps recurrent state across turns instead of replaying the full transcript every time, which reduces chat latency growth.
 
 ---
 
@@ -91,9 +91,9 @@ cargo run --release -- \
   --weights /path/to/model_weights.pth.safetensors \
   --top_p 0.6 \
   --temperature 0.8
-
-# In interactive mode, `\reset` now clears both the visible transcript and the cached recurrent state.
 ```
+
+In interactive mode, `\reset` clears both the visible transcript and the cached recurrent state.
 
 ### Continue inference from a trained Burn checkpoint
 

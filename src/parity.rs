@@ -3,8 +3,7 @@ use burn::backend::{LibTorch, Wgpu};
 use rwkv_tokenizer::WorldTokenizer;
 
 use crate::{
-    Config,
-    load_or_init_model,
+    Config, load_or_init_model,
     model::{FrontPathStrategy, StepTrace, TensorSnapshot},
 };
 
@@ -27,7 +26,7 @@ pub fn run(config: &Config) -> Result<()> {
     let mut stable_model = load_or_init_model::<StableBackend>(config, &stable_device)?;
     let mut candidate_model = load_or_init_model::<CandidateBackend>(config, &candidate_device)?;
     if config.stable_frontpath {
-        candidate_model.set_front_path_strategy(FrontPathStrategy::HostLinear);
+        candidate_model.set_front_path_strategy(FrontPathStrategy::GpuChunkedLinear);
     }
     let tokenizer = WorldTokenizer::new(Some(&config.vocab_path))?;
 
@@ -97,15 +96,16 @@ pub fn run(config: &Config) -> Result<()> {
             .map(|diff| diff.max_abs)
             .unwrap_or(0.0)
             .max(logits_diff.max_abs);
-        let step_label = if logits_diff.max_abs >= step_worst.as_ref().map(|item| item.max_abs).unwrap_or(0.0) {
-            format!("model_logits (mean_abs={:.6})", logits_diff.mean_abs)
-        } else {
-            let diff = step_worst.as_ref().unwrap();
-            format!(
-                "{} (mean_abs={:.6}, idx={}, lhs={:.6}, rhs={:.6})",
-                diff.name, diff.mean_abs, diff.worst_index, diff.lhs_value, diff.rhs_value
-            )
-        };
+        let step_label =
+            if logits_diff.max_abs >= step_worst.as_ref().map(|item| item.max_abs).unwrap_or(0.0) {
+                format!("model_logits (mean_abs={:.6})", logits_diff.mean_abs)
+            } else {
+                let diff = step_worst.as_ref().unwrap();
+                format!(
+                    "{} (mean_abs={:.6}, idx={}, lhs={:.6}, rhs={:.6})",
+                    diff.name, diff.mean_abs, diff.worst_index, diff.lhs_value, diff.rhs_value
+                )
+            };
 
         println!(
             "token {:>3} {:>6} worst_abs_diff={:.6} at {}",
@@ -122,7 +122,10 @@ pub fn run(config: &Config) -> Result<()> {
         }
     }
 
-    println!("Overall worst_abs_diff={:.6} at {}", worst_diff, worst_label);
+    println!(
+        "Overall worst_abs_diff={:.6} at {}",
+        worst_diff, worst_label
+    );
 
     if mismatch_found {
         bail!(
