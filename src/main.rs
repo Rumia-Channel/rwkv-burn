@@ -343,7 +343,7 @@ fn run_generate_with_backend<B: Backend>(config: &Config) -> Result<()> {
     };
     generator.set_inference_mode(effective_mode);
 
-    let mut state = None;
+    let mut transcript = String::new();
     loop {
         print!("User: ");
         let _ = io::stdout().flush();
@@ -358,15 +358,29 @@ fn run_generate_with_backend<B: Backend>(config: &Config) -> Result<()> {
                 }
 
                 if trimmed_input.eq_ignore_ascii_case("\\reset") {
-                    state = Some(model.get_init_state());
-                    println!("Resetting internal model state.");
+                    transcript.clear();
+                    println!("Resetting conversation transcript.");
                     continue;
                 }
+
+                let prompt = if transcript.is_empty() {
+                    format!("User: {}\n\nAssistant:", trimmed_input)
+                } else {
+                    format!("{}\n\nUser: {}\n\nAssistant:", transcript, trimmed_input)
+                };
 
                 print!("Assistant: ");
                 let _ = io::stdout().flush();
 
-                (_, state) = generator.generate(trimmed_input, config.max_new_tokens, state);
+                let completion = generator.generate_from_prompt(&prompt, config.max_new_tokens);
+                print!("{}", completion);
+                let _ = io::stdout().flush();
+
+                transcript = if transcript.is_empty() {
+                    format!("User: {}\n\nAssistant:{}", trimmed_input, completion)
+                } else {
+                    format!("{}\n\nUser: {}\n\nAssistant:{}", transcript, trimmed_input, completion)
+                };
             }
             Err(err) => println!("Could not read input: {err}"),
         }

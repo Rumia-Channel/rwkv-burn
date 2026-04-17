@@ -1,7 +1,4 @@
-use std::{
-    io::{self, Write},
-    str::Utf8Error,
-};
+use std::str::Utf8Error;
 
 use burn::{
     prelude::*,
@@ -11,6 +8,8 @@ use rand::prelude::*;
 use rwkv_tokenizer::WorldTokenizer;
 
 use crate::model::{LayerState, RWKVv7};
+
+const TURN_STOP_MARKERS: [&str; 3] = ["\n\nUser:", "\nUser:", "User:"];
 
 /// Defines the inference mode for text generation.
 #[derive(Debug, Clone, Copy)]
@@ -66,63 +65,20 @@ impl<'a, B: Backend> Generator<'a, B> {
         self.inference_mode = inference_mode;
     }
 
-    /// Generates text based on the given prompt and maximum token count.
-    ///
-    /// Chooses the forward path (parallel or sequential) depending on the selected
-    /// inference mode. Uses provided state or initializes from scratch.
-    ///
-    /// # Arguments
-    /// * `prompt` - Initial input string to condition the generation.
-    /// * `max_new_tokens` - Number of tokens to generate.
-    /// * `state` - Optional RNN state to continue from previous generation.
-    ///
-    /// # Returns
-    /// A tuple of `(generated_string, final_state)`.
-    pub fn generate(
-        &mut self,
-        prompt: &str,
-        max_new_tokens: usize,
-        state: Option<Vec<LayerState<B>>>,
-    ) -> (String, Option<Vec<LayerState<B>>>) {
-
-        // apply prompt template
-        let prompt = format!("User: {}\n\nAssistant:", prompt.trim());
-        
-        // inference mode selection
+    pub fn generate_from_prompt(&mut self, prompt: &str, max_new_tokens: usize) -> String {
         match self.inference_mode {
-            // transformer like inference (slow)
-            InferenceMode::Parallel => {
-                let (completion, state) = self.generate_parallel(&prompt, max_new_tokens);
-
-                (completion, Some(state))
-            },
-            // RNN like inference (fast)
+            InferenceMode::Parallel => self.generate_parallel(prompt, max_new_tokens).0,
             InferenceMode::Sequential => {
-                let mut _state: Vec<LayerState<B>>;
-
-                if let Some(state) = state {
-                    _state = state;
-                } else {
-                    _state = self.model.get_init_state();
-                }
-
-                let (completion, _state) = self.generate_sequential(&prompt, max_new_tokens, _state);
-
-                (completion, Some(_state))
-            },
-            // mixed inference (default)
-            // first parallel, then sequential
+                let state = self.model.get_init_state();
+                self.generate_sequential(prompt, max_new_tokens, state).0
+            }
             InferenceMode::Mixed => {
-                if let Some(state) = state {
-                    let (completion, state) = self.generate_sequential(&prompt, max_new_tokens, state);
-
-                    (completion, Some(state))
-
+                let (prompt_plus_first_token, state) = self.generate_parallel(prompt, 1);
+                if max_new_tokens <= 1 {
+                    prompt_plus_first_token
                 } else {
-                    let (completion, state) = self.generate_parallel(&prompt, 1);
-                    let (completion, state) = self.generate_sequential(&completion, max_new_tokens-1, state);
-
-                    (completion, Some(state))
+                    self.generate_sequential(&prompt_plus_first_token, max_new_tokens - 1, state)
+                        .0
                 }
             }
         }
@@ -186,28 +142,28 @@ impl<'a, B: Backend> Generator<'a, B> {
 
         let mut last_token: i32 = 0;
 
-        let mut out = "".to_string();
+        let mut out = String::new();
 
         for token in x {
             (y, state) = self.model.forward_rnn(token, state);
 
             if let (Ok(string), token, _) = self.sample_next_token(y) {
+                out.clear();
+                if append_and_check_stop(&mut out, &string) {
+                    return (out, state);
+                }
                 last_token = token as i32;
-                out = string;
             }
         }
-
-        print!("{}", &out);
 
         for _ in 0..max_new_tokens {
             (y, state) = self.model.forward_rnn(last_token, state);
 
             if let (Ok(string), token, _) = self.sample_next_token(y) {
+                if append_and_check_stop(&mut out, &string) {
+                    break;
+                }
                 last_token = token as i32;
-                out += &string;
-
-                print!("{}", &string);
-                let _ = io::stdout().flush();
 
                 // stop at EndOfText token
                 if token == 0 {
@@ -234,18 +190,19 @@ impl<'a, B: Backend> Generator<'a, B> {
         max_new_tokens: usize,
     ) -> (String, Vec<LayerState<B>>) {
 
-        let mut out = prompt.to_string();
+        let mut prompt_with_first_token = prompt.to_string();
+        let mut generated = String::new();
         let mut state: Vec<LayerState<B>> = Vec::<LayerState<B>>::with_capacity(self.model.layers.len());
 
         for _ in 0..max_new_tokens {
-            let x = self.prompt_to_tensor(&out);
+            let x = self.prompt_to_tensor(&prompt_with_first_token);
             let y;
             (y, state) = self.model.forward_parallel(x);
             if let (Ok(string), token, _) = self.sample_next_token(y.reshape([-1])) {
-                out += &string;
-
-                print!("{}", &string);
-                let _ = io::stdout().flush();
+                prompt_with_first_token += &string;
+                if append_and_check_stop(&mut generated, &string) {
+                    break;
+                }
 
                 if token == 0 {
                     break;
@@ -253,7 +210,7 @@ impl<'a, B: Backend> Generator<'a, B> {
             }
         }
 
-        (out, state)
+        (generated, state)
     }
 
     /// Samples the next token from a model output distribution using temperature, top-k and top-p filtering
@@ -337,4 +294,19 @@ impl<'a, B: Backend> Generator<'a, B> {
             )
         }
     }
+}
+
+fn append_and_check_stop(output: &mut String, chunk: &str) -> bool {
+    output.push_str(chunk);
+
+    if let Some(index) = TURN_STOP_MARKERS
+        .iter()
+        .filter_map(|marker| output.find(marker))
+        .min()
+    {
+        output.truncate(index);
+        return true;
+    }
+
+    false
 }
